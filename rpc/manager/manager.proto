@@ -255,6 +255,15 @@ message VersionInfo2 {
   string version = 2;
 }
 
+// UDPDatagram describes a UDP datagram in full
+message UDPDatagram {
+  bytes source_ip = 1;
+  int32 source_port = 2;
+  bytes destination_ip = 3;
+  int32 destination_port = 4;
+  bytes payload = 5;
+}
+
 service Manager {
   // Version returns the version information of the Manager.
   rpc Version(google.protobuf.Empty) returns (VersionInfo2);
@@ -308,4 +317,8 @@ service Manager {
   // changing the disposition from "WATING" to "ACTIVE" or to an
   // error, and setting a human-readable status message.
   rpc ReviewIntercept(ReviewInterceptRequest) returns (google.protobuf.Empty);
+
+  // UDPTunnel receives datagrams from the client, dials a UDP connection based on
+  // the destination address, and posts the replies that it receives.
+  rpc UDPTunnel(stream UDPDatagram) returns (stream UDPDatagram);
 }
