@@ -92,7 +92,7 @@ type Workflow struct {
 	// the dispatcher signals its intent to close in dispatcherClosing. 0 == running, 1 == closing, 2 == closed
 	dispatcherClosing *int32
 
-	// Channel to use when sending packages to the socksConn
+	// Channel to use when sending messages to the traffic-manager
 	toMgr chan Packet
 
 	// queue where unacked elements are placed until they are acked
@@ -197,7 +197,7 @@ func (c *Workflow) adjustReceiveWindow() {
 	c.setReceiveWindow(uint16(windowSize))
 }
 
-func (c *Workflow) sendToSocks(ctx context.Context, pkt Packet) bool {
+func (c *Workflow) sendToMgr(ctx context.Context, pkt Packet) bool {
 	select {
 	case c.toMgr <- pkt:
 		c.adjustReceiveWindow()
@@ -395,7 +395,7 @@ func (c *Workflow) synReceived(ctx context.Context, pkt Packet) quitReason {
 	if pl != 0 {
 		c.setSequence(c.sequence() + uint32(pl))
 		c.pushToAckWait(uint32(pl), pkt)
-		if !c.sendToSocks(ctx, pkt) {
+		if !c.sendToMgr(ctx, pkt) {
 			return quitByContext
 		}
 		release = false
@@ -456,7 +456,7 @@ func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
 	switch {
 	case len(tcpHdr.Payload()) > 0:
 		c.setSequenceLastAcked(lastAck + uint32(len(tcpHdr.Payload())))
-		if !c.sendToSocks(ctx, pkt) {
+		if !c.sendToMgr(ctx, pkt) {
 			return quitByContext
 		}
 		release = false

@@ -106,7 +106,7 @@ func protoString(proto int) string {
 
 // ReplyString returns a formatted string suitable for logging showing the destination:destinationPort -> source:sourcePort
 func (id ConnID) ReplyString() string {
-	return fmt.Sprintf("%s %s:%d -> %s:%d", unix.IPPROTO_UDP, id.Destination(), id.DestinationPort(), id.Source(), id.SourcePort())
+	return fmt.Sprintf("%s %s:%d -> %s:%d", protoString(id.Protocol()), id.Destination(), id.DestinationPort(), id.Source(), id.SourcePort())
 }
 
 // String returns a formatted string suitable for logging showing the source:sourcePort -> destination:destinationPort
