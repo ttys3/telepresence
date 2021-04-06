@@ -2,12 +2,11 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
-	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/internal/udpgrpc"
-
-	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
+	"golang.org/x/sys/unix"
 
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -19,6 +18,9 @@ import (
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/rpc/v2/systema"
 	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/internal/state"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/internal/tcpgrpc"
+	"github.com/telepresenceio/telepresence/v2/cmd/traffic/cmd/manager/internal/udpgrpc"
+	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
 	"github.com/telepresenceio/telepresence/v2/pkg/version"
 )
 
@@ -34,7 +36,6 @@ type Manager struct {
 	ID      string
 	state   *state.State
 	systema *systemaPool
-	udpPool *connpool.Pool
 
 	rpc.UnsafeManagerServer
 }
@@ -47,12 +48,11 @@ func (wall) Now() time.Time {
 
 func NewManager(ctx context.Context, env Env) *Manager {
 	ret := &Manager{
-		ctx:     ctx,
-		clock:   wall{},
-		env:     env,
-		ID:      uuid.New().String(),
-		state:   state.NewState(ctx),
-		udpPool: connpool.NewPool(),
+		ctx:   ctx,
+		clock: wall{},
+		env:   env,
+		ID:    uuid.New().String(),
+		state: state.NewState(ctx),
 	}
 	ret.systema = NewSystemAPool(ret)
 	return ret
@@ -417,7 +417,9 @@ func (m *Manager) ReviewIntercept(ctx context.Context, rIReq *rpc.ReviewIntercep
 	return &empty.Empty{}, nil
 }
 
-func (m *Manager) UDPTunnel(server rpc.Manager_UDPTunnelServer) error {
+func (m *Manager) ConnTunnel(server rpc.Manager_ConnTunnelServer) error {
+	dlog.Debug(m.ctx, "Established TCP tunnel")
+	pool := connpool.NewPool() // must have one pool per tunnel (per client, really)
 	for {
 		dg, err := server.Recv()
 		if err != nil {
@@ -426,20 +428,45 @@ func (m *Manager) UDPTunnel(server rpc.Manager_UDPTunnelServer) error {
 			}
 			return err
 		}
-		m.handleUDPPackage(server, dg)
+		m.handleTunnelMessage(pool, server, dg)
 	}
 }
 
-func (m *Manager) handleUDPPackage(server rpc.Manager_UDPTunnelServer, dg *rpc.UDPDatagram) {
-	id := connpool.NewConnID(dg.SourceIp, dg.DestinationIp, uint16(dg.SourcePort), uint16(dg.DestinationPort))
-	utuh, err := m.udpPool.Get(m.ctx, id, func(ctx context.Context, release func()) (connpool.Handler, error) {
-		return udpgrpc.NewHandler(ctx, id, server, release)
+func (m *Manager) handleTunnelMessage(pool *connpool.Pool, server rpc.Manager_ConnTunnelServer, cm *rpc.ConnMessage) {
+	var id connpool.ConnID
+	var ctrl *connpool.ControlMessage
+	var err error
+	if connpool.IsControlMessage(cm) {
+		ctrl, err = connpool.NewControlMessage(cm)
+		if err != nil {
+			dlog.Error(m.ctx, err)
+			return
+		}
+		id = ctrl.ID
+	} else {
+		id = connpool.ConnID(cm.ConnId)
+	}
+
+	// Retrieve the connection that is tracked for the given id. Create a new one if necessary
+	h, err := pool.Get(m.ctx, id, func(ctx context.Context, release func()) (connpool.Handler, error) {
+		switch id.Protocol() {
+		case unix.IPPROTO_TCP:
+			return tcpgrpc.NewHandler(ctx, id, server, release)
+		case unix.IPPROTO_UDP:
+			return udpgrpc.NewHandler(ctx, id, server, release)
+		default:
+			return nil, fmt.Errorf("unhadled L4 protocol: %d", id.Protocol())
+		}
 	})
 	if err != nil {
-		dlog.Errorf(m.ctx, "failed to get UDP handler: %v", err)
+		dlog.Errorf(m.ctx, "failed to get connection handler: %v", err)
 		return
 	}
-	utuh.(*udpgrpc.Handler).Send(m.ctx, dg)
+	if ctrl != nil {
+		h.HandleControl(m.ctx, ctrl)
+	} else {
+		h.HandleMessage(m.ctx, cm)
+	}
 }
 
 // expire removes stale sessions.

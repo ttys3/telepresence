@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/tun/ip"
+
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
@@ -13,9 +15,10 @@ import (
 )
 
 type Handler struct {
-	*Stream
+	*connpool.Stream
 	id        connpool.ConnID
 	remove    func()
+	toTun     chan<- ip.Packet
 	fromTun   chan Datagram
 	idleTimer *time.Timer
 }
@@ -46,12 +49,37 @@ func (c *Handler) NewDatagram(ctx context.Context, dg Datagram) {
 	}
 }
 
-func NewHandler(stream *Stream, id connpool.ConnID, remove func()) *Handler {
+func NewHandler(stream *connpool.Stream, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) *Handler {
 	return &Handler{
 		Stream:  stream,
 		id:      id,
+		toTun:   toTun,
 		remove:  remove,
 		fromTun: make(chan Datagram, ioChannelSize),
+	}
+}
+
+func (c *Handler) HandleControl(_ context.Context, _ *connpool.ControlMessage) {
+
+}
+
+func (c *Handler) HandleMessage(ctx context.Context, mdg *manager.ConnMessage) {
+	pkt := NewDatagram(HeaderLen+len(mdg.Payload), c.id.Destination(), c.id.Source())
+	ipHdr := pkt.IPHeader()
+	ipHdr.SetChecksum()
+
+	udpHdr := Header(ipHdr.Payload())
+	udpHdr.SetSourcePort(c.id.DestinationPort())
+	udpHdr.SetDestinationPort(c.id.SourcePort())
+	udpHdr.SetPayloadLen(uint16(len(mdg.Payload)))
+	copy(udpHdr.Payload(), mdg.Payload)
+	udpHdr.SetChecksum(ipHdr)
+
+	dlog.Debugf(ctx, "<- MGR %s", pkt)
+	select {
+	case <-ctx.Done():
+		return
+	case c.toTun <- pkt:
 	}
 }
 
@@ -64,14 +92,8 @@ func (c *Handler) writerLoop(ctx context.Context) {
 			c.idleTimer.Reset(idleDuration)
 
 			udpHdr := dg.Header()
-			dlog.Debugf(ctx, "-> SOC: %s", dg)
-			err := c.bidiStream.Send(&manager.UDPDatagram{
-				SourceIp:        c.id.Source(),
-				SourcePort:      int32(c.id.SourcePort()),
-				DestinationIp:   c.id.Destination(),
-				DestinationPort: int32(c.id.DestinationPort()),
-				Payload:         udpHdr.Payload(),
-			})
+			dlog.Debugf(ctx, "-> MGR %s", dg)
+			err := c.SendMsg(&manager.ConnMessage{ConnId: []byte(c.id), Payload: udpHdr.Payload()})
 			dg.SoftRelease()
 			if err != nil {
 				if ctx.Err() == nil {

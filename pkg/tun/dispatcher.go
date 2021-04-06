@@ -8,17 +8,15 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"google.golang.org/grpc"
-
-	"github.com/telepresenceio/telepresence/v2/pkg/client"
-
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
 
 	"github.com/datawire/dlib/dgroup"
 	"github.com/datawire/dlib/dlog"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
+	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun/buffer"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun/icmp"
@@ -32,9 +30,8 @@ type Dispatcher struct {
 	dev            *Device
 	socksTCPDialer socks.Dialer
 	managerClient  manager.ManagerClient
-	udpStream      *udp.Stream
-	udpHandlers    *connpool.Pool
-	tcpHandlers    *connpool.Pool
+	connStream     *connpool.Stream
+	handlers       *connpool.Pool
 	handlersWg     sync.WaitGroup
 	toTunCh        chan ip.Packet
 	fragmentMap    map[uint16][]*buffer.Data
@@ -45,8 +42,7 @@ type Dispatcher struct {
 func NewDispatcher(dev *Device) *Dispatcher {
 	return &Dispatcher{
 		dev:         dev,
-		udpHandlers: connpool.NewPool(),
-		tcpHandlers: connpool.NewPool(),
+		handlers:    connpool.NewPool(),
 		toTunCh:     make(chan ip.Packet, 100),
 		dialersSet:  make(chan struct{}),
 		fragmentMap: make(map[uint16][]*buffer.Data),
@@ -83,8 +79,7 @@ func (d *Dispatcher) SetPorts(ctx context.Context, socksPort, managerPort uint16
 
 func (d *Dispatcher) Stop(c context.Context) {
 	atomic.StoreInt32(&d.closing, 1)
-	d.udpHandlers.CloseAll(c)
-	d.tcpHandlers.CloseAll(c)
+	d.handlers.CloseAll(c)
 	d.handlersWg.Wait()
 	atomic.StoreInt32(&d.closing, 2)
 	d.dev.Close()
@@ -106,7 +101,7 @@ func (d *Dispatcher) Run(c context.Context) error {
 			case <-c.Done():
 				return nil
 			case pkt := <-d.toTunCh:
-				// dlog.Debugf(c, "-> TUN: %s", pkt)
+				dlog.Debugf(c, "-> TUN: %s", pkt)
 				_, err := d.dev.Write(pkt.Data())
 				pkt.SoftRelease()
 				if err != nil {
@@ -120,7 +115,7 @@ func (d *Dispatcher) Run(c context.Context) error {
 		return nil
 	})
 
-	g.Go("MGR udp-stream", func(c context.Context) error {
+	g.Go("MGR stream", func(c context.Context) error {
 		// Block here until socks dialers are configured
 		select {
 		case <-c.Done():
@@ -129,13 +124,13 @@ func (d *Dispatcher) Run(c context.Context) error {
 		}
 
 		if d.managerClient != nil {
-			// TODO: UDPTunnel should probably provide a sessionID
-			udpStream, err := d.managerClient.UDPTunnel(c)
+			// TODO: ConnTunnel should probably provide a sessionID
+			tcpStream, err := d.managerClient.ConnTunnel(c)
 			if err != nil {
 				return err
 			}
-			d.udpStream = udp.NewStream(udpStream, d.toTunCh)
-			return d.udpStream.ReadLoop(c)
+			d.connStream = connpool.NewStream(tcpStream, d.handlers)
+			return d.connStream.ReadLoop(c)
 		}
 		return nil
 	})
@@ -210,10 +205,6 @@ func (d *Dispatcher) handlePacket(c context.Context, data *buffer.Data) {
 		d.tcp(c, tcp.MakePacket(ipHdr, data))
 		data = nil
 	case unix.IPPROTO_UDP:
-		if d.udpStream == nil {
-			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, icmp.ProtocolUnreachable)
-			return
-		}
 		dst := ipHdr.Destination()
 		if dst.IsLinkLocalUnicast() || dst.IsLinkLocalMulticast() {
 			// Just ignore at this point.
@@ -243,11 +234,11 @@ func (d *Dispatcher) handlePacket(c context.Context, data *buffer.Data) {
 }
 
 func (d *Dispatcher) tcp(c context.Context, pkt tcp.Packet) {
-	// dlog.Debugf(c, "<- TUN %s", pkt)
+	dlog.Debugf(c, "<- TUN %s", pkt)
 	ipHdr := pkt.IPHeader()
 	tcpHdr := pkt.Header()
-	connID := connpool.NewConnID(ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
-	wf, err := d.tcpHandlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
+	connID := connpool.NewConnID(unix.IPPROTO_TCP, ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
+	wf, err := d.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		if tcpHdr.RST() {
 			return nil, errors.New("dispatching got RST without connection workflow")
 		}
@@ -258,7 +249,7 @@ func (d *Dispatcher) tcp(c context.Context, pkt tcp.Packet) {
 			case d.toTunCh <- pkt.Reset():
 			}
 		}
-		wf := tcp.NewWorkflow(d.socksTCPDialer, &d.closing, d.toTunCh, connID, remove)
+		wf := tcp.NewWorkflow(d.connStream, &d.closing, d.toTunCh, connID, remove)
 		d.handlersWg.Add(1)
 		go wf.Run(c, &d.handlersWg)
 		return wf, nil
@@ -274,9 +265,9 @@ func (d *Dispatcher) udp(c context.Context, dg udp.Datagram) {
 	dlog.Debugf(c, "<- TUN %s", dg)
 	ipHdr := dg.IPHeader()
 	udpHdr := dg.Header()
-	connID := connpool.NewConnID(ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
-	uh, err := d.udpHandlers.Get(c, connID, func(c context.Context, release func()) (connpool.Handler, error) {
-		handler := udp.NewHandler(d.udpStream, connID, release)
+	connID := connpool.NewConnID(unix.IPPROTO_UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
+	uh, err := d.handlers.Get(c, connID, func(c context.Context, release func()) (connpool.Handler, error) {
+		handler := udp.NewHandler(d.connStream, d.toTunCh, connID, release)
 		d.handlersWg.Add(1)
 		go handler.Run(c, &d.handlersWg)
 		return handler, nil

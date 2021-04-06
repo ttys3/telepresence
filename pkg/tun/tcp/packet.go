@@ -70,7 +70,7 @@ func (p *packet) String() string {
 	b := bytes.Buffer{}
 	ipHdr := p.IPHeader()
 	tcpHdr := p.Header()
-	fmt.Fprintf(&b, "tcp sq %.3d, an %.3d, %s.%d -> %s.%d, flags=",
+	fmt.Fprintf(&b, "tcp sq %.3d, an %.3d, %s:%d -> %s:%d, flags=",
 		tcpHdr.Sequence(), tcpHdr.AckNumber(), ipHdr.Source(), tcpHdr.SourcePort(), ipHdr.Destination(), tcpHdr.DestinationPort())
 	tcpHdr.AppendFlags(&b)
 	return b.String()

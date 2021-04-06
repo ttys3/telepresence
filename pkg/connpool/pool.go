@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/telepresenceio/telepresence/rpc/v2/manager"
+
 	"github.com/datawire/dlib/dlog"
 )
 
@@ -15,6 +17,10 @@ type Pool struct {
 type Handler interface {
 	// Close closes the handle
 	Close(context.Context)
+
+	HandleControl(ctx context.Context, ctrl *ControlMessage)
+
+	HandleMessage(ctx context.Context, message *manager.ConnMessage)
 }
 
 func NewPool() *Pool {
@@ -33,7 +39,7 @@ func (p *Pool) Get(ctx context.Context, id ConnID, createHandler func(ctx contex
 	defer p.lock.Unlock()
 
 	handler, ok := p.handlers[id]
-	if ok {
+	if ok || createHandler == nil {
 		return handler, nil
 	}
 

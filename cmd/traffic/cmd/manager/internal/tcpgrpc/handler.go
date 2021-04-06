@@ -1,4 +1,4 @@
-package udpgrpc
+package tcpgrpc
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 )
 
 // The idleDuration controls how long a handler remains alive without reading or writing any messages
-const idleDuration = time.Second
+const idleDuration = 2 * time.Minute
 
 // The Handler takes care of dispatching messages between gRPC and UDP connections
 type Handler struct {
@@ -22,7 +22,7 @@ type Handler struct {
 	release   func()
 	server    rpc.Manager_ConnTunnelServer
 	incoming  chan *rpc.ConnMessage
-	conn      *net.UDPConn
+	conn      *net.TCPConn
 	idleTimer *time.Timer
 }
 
@@ -32,39 +32,61 @@ type Handler struct {
 // The handler remains active until it's been idle for idleDuration, at which time it will automatically close
 // and call the release function it got from the connpool.Pool to ensure that it gets properly released.
 func NewHandler(ctx context.Context, connID connpool.ConnID, server rpc.Manager_ConnTunnelServer, release func()) (connpool.Handler, error) {
-	destAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", connID.Destination(), connID.DestinationPort()))
-	if err != nil {
-		return nil, fmt.Errorf("connection %s unable to resolve destination address: %v", connID, err)
-	}
-	conn, err := net.DialUDP("udp", nil, destAddr)
-	if err != nil {
-		return nil, fmt.Errorf("connection %s failed: %v", connID, err)
-	}
 	handler := &Handler{
 		id:       connID,
 		server:   server,
 		release:  release,
-		conn:     conn,
 		incoming: make(chan *rpc.ConnMessage, 10),
 	}
 
 	// Set up the idle timer to close and release this handler when it's been idle for a while.
 	handler.ctx, handler.cancel = context.WithCancel(ctx)
-
 	handler.idleTimer = time.AfterFunc(idleDuration, func() {
 		handler.release()
 		handler.Close(handler.ctx)
 	})
-	go handler.readLoop()
-	go handler.writeLoop()
 	return handler, nil
 }
 
-func (h *Handler) HandleControl(_ context.Context, _ *connpool.ControlMessage) {
-	// UDP handler doesn't do controls
+func (h *Handler) HandleControl(ctx context.Context, cm *connpool.ControlMessage) {
+	var reply connpool.ControlCode
+	switch cm.Code {
+	case connpool.Connect:
+		if h.conn != nil {
+			break
+		}
+		destAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", cm.ID.Destination(), cm.ID.DestinationPort()))
+		if err != nil {
+			dlog.Errorf(ctx, "connection %s unable to resolve destination address: %v", cm.ID, err)
+			reply = connpool.ConnectReject
+			break
+		}
+		conn, err := net.DialTCP("tcp4", nil, destAddr)
+		if err != nil {
+			dlog.Errorf(ctx, "connection %s failed: %v", cm.ID, err)
+			reply = connpool.ConnectReject
+			break
+		}
+		h.conn = conn
+		reply = connpool.ConnectOK
+		go h.readLoop()
+		go h.writeLoop()
+	case connpool.Disconnect:
+		if h.idleTimer.Stop() {
+			h.release()
+			h.Close(ctx)
+		}
+		reply = connpool.DisconnectOK
+	default:
+		dlog.Errorf(ctx, "unhandled connection control message: %s", cm)
+		return
+	}
+	if err := h.sendTCD(reply); err != nil {
+		dlog.Error(ctx, err)
+	}
 }
 
-// HandleMessage a package to the underlying UDP connection
+// Send a package to the underlying TCP connection
 func (h *Handler) HandleMessage(ctx context.Context, dg *rpc.ConnMessage) {
 	select {
 	case <-ctx.Done():
@@ -73,9 +95,22 @@ func (h *Handler) HandleMessage(ctx context.Context, dg *rpc.ConnMessage) {
 	}
 }
 
-// Close will close the underlying UDP connection
+// Close will close the underlying TCP connection
 func (h *Handler) Close(_ context.Context) {
-	_ = h.conn.Close()
+	conn := h.conn
+	h.conn = nil
+	if conn != nil {
+		_ = conn.Close()
+	}
+	h.cancel()
+}
+
+func (h *Handler) sendTCD(code connpool.ControlCode) error {
+	err := h.server.Send(connpool.ConnControl(h.id, code))
+	if err != nil {
+		err = fmt.Errorf("failed to send control message: %v", err)
+	}
+	return err
 }
 
 func (h *Handler) readLoop() {
@@ -84,6 +119,9 @@ func (h *Handler) readLoop() {
 		n, err := h.conn.Read(b)
 		if err != nil {
 			h.idleTimer.Stop()
+			if err = h.sendTCD(connpool.ReadClosed); err != nil {
+				dlog.Error(h.ctx, err)
+			}
 			return
 		}
 		// dlog.Debugf(ctx, "%s read TCP package of size %d", uh.id, n)

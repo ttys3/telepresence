@@ -3,21 +3,21 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
-	"net"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
+	"github.com/telepresenceio/telepresence/v2/pkg/tun/ip"
+
+	"github.com/telepresenceio/telepresence/rpc/v2/manager"
+
 	"golang.org/x/sys/unix"
 
 	"github.com/datawire/dlib/dlog"
 	"github.com/datawire/dlib/dtime"
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun/buffer"
-	"github.com/telepresenceio/telepresence/v2/pkg/tun/ip"
-	"github.com/telepresenceio/telepresence/v2/pkg/tun/socks"
 )
 
 type state int32
@@ -76,6 +76,8 @@ const (
 )
 
 type Workflow struct {
+	*connpool.Stream
+
 	// id identifies this connection. It contains source and destination IPs and ports
 	id connpool.ConnID
 
@@ -83,18 +85,15 @@ type Workflow struct {
 	remove func()
 
 	// TUN channels
-	toTun   chan<- ip.Packet
+	ToTun   chan<- ip.Packet
 	fromTun chan Packet
+	fromMgr chan *manager.ConnMessage
 
 	// the dispatcher signals its intent to close in dispatcherClosing. 0 == running, 1 == closing, 2 == closed
 	dispatcherClosing *int32
 
-	// Dialer to user when establishing a socks connection
-	socksDialer socks.Dialer
-	socksConn   net.Conn
-
 	// Channel to use when sending packages to the socksConn
-	toSocks chan Packet
+	toMgr chan Packet
 
 	// queue where unacked elements are placed until they are acked
 	ackWaitQueue     *queueElement
@@ -102,6 +101,10 @@ type Workflow struct {
 
 	// oooQueue is where out-of-order packages are placed until they can be processed
 	oooQueue *queueElement
+
+	// synPacket is the initial syn packet received on a connect request. It is
+	// dropped once the manager responds to the connect attempt
+	synPacket Packet
 
 	// wfState is the current workflow state
 	wfState state
@@ -120,15 +123,16 @@ type Workflow struct {
 	rcvWnd  int32
 }
 
-func NewWorkflow(socksDialer socks.Dialer, cloeState *int32, toTunCh chan<- ip.Packet, id connpool.ConnID, remove func()) *Workflow {
+func NewWorkflow(tcpStream *connpool.Stream, dispatcherClosing *int32, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) *Workflow {
 	return &Workflow{
+		Stream:            tcpStream,
 		id:                id,
 		remove:            remove,
-		socksDialer:       socksDialer,
-		dispatcherClosing: cloeState,
-		toTun:             toTunCh,
+		ToTun:             toTun,
+		fromMgr:           make(chan *manager.ConnMessage, ioChannelSize),
+		dispatcherClosing: dispatcherClosing,
 		fromTun:           make(chan Packet, ioChannelSize),
-		toSocks:           make(chan Packet, ioChannelSize),
+		toMgr:             make(chan Packet, ioChannelSize),
 		sendWnd:           int32(maxSendWindow),
 		rcvWnd:            int32(maxReceiveWindow),
 		wfState:           stateIdle,
@@ -144,14 +148,37 @@ func (c *Workflow) NewPacket(ctx context.Context, pkt Packet) {
 
 func (c *Workflow) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer func() {
-		if c.socksConn != nil {
-			c.socksConn.Close()
-		}
+		_ = c.sendConnControl(ctx, connpool.Disconnect)
 		c.remove()
 		wg.Done()
 	}()
 	go c.processResends(ctx)
 	c.processPackets(ctx)
+}
+
+func (c *Workflow) HandleControl(ctx context.Context, ctrl *connpool.ControlMessage) {
+	switch ctrl.Code {
+	case connpool.ConnectOK:
+		synPacket := c.synPacket
+		c.synPacket = nil
+		if synPacket != nil {
+			defer synPacket.Release()
+			c.sendSyn(ctx, synPacket)
+		}
+	case connpool.ConnectReject:
+		synPacket := c.synPacket
+		c.synPacket = nil
+		if synPacket != nil {
+			synPacket.Release()
+		}
+	}
+}
+
+func (c *Workflow) HandleMessage(ctx context.Context, cm *manager.ConnMessage) {
+	select {
+	case <-ctx.Done():
+	case c.fromMgr <- cm:
+	}
 }
 
 func (c *Workflow) Close(ctx context.Context) {
@@ -162,7 +189,7 @@ func (c *Workflow) Close(ctx context.Context) {
 }
 
 func (c *Workflow) adjustReceiveWindow() {
-	queueSize := len(c.toSocks)
+	queueSize := len(c.toMgr)
 	windowSize := maxReceiveWindow
 	if queueSize > ioChannelSize/4 {
 		windowSize -= queueSize * (maxReceiveWindow / ioChannelSize)
@@ -172,7 +199,7 @@ func (c *Workflow) adjustReceiveWindow() {
 
 func (c *Workflow) sendToSocks(ctx context.Context, pkt Packet) bool {
 	select {
-	case c.toSocks <- pkt:
+	case c.toMgr <- pkt:
 		c.adjustReceiveWindow()
 		return true
 	case <-ctx.Done():
@@ -183,7 +210,7 @@ func (c *Workflow) sendToSocks(ctx context.Context, pkt Packet) bool {
 func (c *Workflow) sendToTun(ctx context.Context, pkt Packet) {
 	select {
 	case <-ctx.Done():
-	case c.toTun <- pkt:
+	case c.ToTun <- pkt:
 	}
 }
 
@@ -255,38 +282,29 @@ func (c *Workflow) sendSyn(ctx context.Context, syn Packet) {
 	c.pushToAckWait(1, pkt)
 }
 
-func (c *Workflow) socksWriterLoop(ctx context.Context) {
+// writeToTunLoop sends the packages read from the toMgr channel to the traffic-manager device
+func (c *Workflow) writeToMgrLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case pkt := <-c.toSocks:
+		case pkt := <-c.toMgr:
 			c.adjustReceiveWindow()
-			tcpHdr := pkt.Header()
-			data := tcpHdr.Payload()
-			for len(data) > 0 {
-				n, err := c.socksConn.Write(data)
-				if err != nil {
-					if ctx.Err() == nil && atomic.LoadInt32(c.dispatcherClosing) == 0 && c.state() < stateFinWait2 {
-						dlog.Errorf(ctx, "failed to write to dispatcher's remote endpoint: %v", err)
-					}
-					return
+			dlog.Debugf(ctx, "-> MGR %s", pkt)
+			err := c.SendMsg(&manager.ConnMessage{ConnId: []byte(c.id), Payload: pkt.Header().Payload()})
+			if err != nil {
+				if ctx.Err() == nil && atomic.LoadInt32(c.dispatcherClosing) == 0 && c.state() < stateFinWait2 {
+					dlog.Errorf(ctx, "failed to write to dispatcher's remote endpoint: %v", err)
 				}
-				data = data[n:]
+				return
 			}
 			pkt.Release()
 		}
 	}
 }
 
-func (c *Workflow) socksReaderLoop(ctx context.Context) {
-	var bothHeadersLen int
-	if c.id.IsIPv4() {
-		bothHeadersLen = ipv4.HeaderLen + HeaderLen
-	} else {
-		bothHeadersLen = ipv6.HeaderLen + HeaderLen
-	}
-
+// writeToTunLoop sends the packages read from the fromMgr channel to the TUN device
+func (c *Workflow) writeToTunLoop(ctx context.Context) {
 	for {
 		window := c.sendWindow()
 		if window == 0 {
@@ -299,36 +317,24 @@ func (c *Workflow) socksReaderLoop(ctx context.Context) {
 			}
 		}
 
-		maxRead := int(window)
-		if maxRead > buffer.DataPool.MTU-bothHeadersLen {
-			maxRead = buffer.DataPool.MTU - bothHeadersLen
+		var cm *manager.ConnMessage
+		select {
+		case <-ctx.Done():
+			return
+		case cm = <-c.fromMgr:
 		}
-
-		pkt := c.newResponse(HeaderLen+maxRead, true)
+		n := len(cm.Payload)
+		pkt := c.newResponse(HeaderLen+n, true)
 		ipHdr := pkt.IPHeader()
 		tcpHdr := pkt.Header()
-		n, err := c.socksConn.Read(tcpHdr.Payload())
-		if err != nil {
-			pkt.Release()
-			if ctx.Err() == nil && atomic.LoadInt32(c.dispatcherClosing) == 0 && c.state() < stateFinWait2 {
-				dlog.Errorf(ctx, "failed to read from dispatcher's remote endpoint: %v", err)
-				if c.state() == stateEstablished {
-					c.sendFin(ctx, true)
-				}
-			}
-			return
-		}
-		if n == 0 {
-			pkt.Release()
-			continue
-		}
-		ipHdr.SetPayloadLen(n + HeaderLen)
+		ipHdr.SetPayloadLen(HeaderLen + n)
 		ipHdr.SetChecksum()
 
 		tcpHdr.SetACK(true)
 		tcpHdr.SetPSH(true)
 		tcpHdr.SetSequence(c.sequence())
 		tcpHdr.SetAckNumber(c.sequenceLastAcked())
+		copy(tcpHdr.Payload(), cm.Payload)
 		tcpHdr.SetChecksum(ipHdr)
 
 		c.sendToTun(ctx, pkt)
@@ -341,22 +347,24 @@ func (c *Workflow) socksReaderLoop(ctx context.Context) {
 	}
 }
 
-func (c *Workflow) idle(ctx context.Context, syn Packet) quitReason {
-	defer syn.Release()
-	conn, err := c.socksDialer.DialContext(ctx, c.id.Source(), c.id.SourcePort(), c.id.Destination(), c.id.DestinationPort())
-	if err != nil {
-		dlog.Errorf(ctx, "Unable to connect to socks server: %v", err)
-		select {
-		case <-ctx.Done():
-			return quitByContext
-		case c.toTun <- syn.Reset():
-		}
-		return quitByReset
+func (c *Workflow) sendConnControl(ctx context.Context, code connpool.ControlCode) error {
+	pkt := connpool.ConnControl(c.id, code)
+	dlog.Debugf(ctx, "-> MGR %s, code %s", c.id, code)
+	if err := c.SendMsg(pkt); err != nil {
+		return fmt.Errorf("failed to send control package: %v", err)
 	}
-	c.socksConn = conn
+	return nil
+}
 
+func (c *Workflow) idle(ctx context.Context, syn Packet) quitReason {
+	c.synPacket = syn
+	if err := c.sendConnControl(ctx, connpool.Connect); err != nil {
+		dlog.Error(ctx, err)
+		c.synPacket = nil
+		c.sendToTun(ctx, syn.Reset())
+		return quitByUs
+	}
 	c.setSequence(1)
-	c.sendSyn(ctx, syn)
 	c.setState(ctx, stateSynReceived)
 	return pleaseContinue
 }
@@ -379,12 +387,14 @@ func (c *Workflow) synReceived(ctx context.Context, pkt Packet) quitReason {
 
 	c.ackReceived(tcpHdr.AckNumber())
 	c.setState(ctx, stateEstablished)
-	go c.socksWriterLoop(ctx)
-	go c.socksReaderLoop(ctx)
+	go c.writeToMgrLoop(ctx)
+	go c.writeToTunLoop(ctx)
 
 	pl := len(tcpHdr.Payload())
 	c.setSequenceLastAcked(tcpHdr.Sequence() + uint32(pl))
 	if pl != 0 {
+		c.setSequence(c.sequence() + uint32(pl))
+		c.pushToAckWait(uint32(pl), pkt)
 		if !c.sendToSocks(ctx, pkt) {
 			return quitByContext
 		}
@@ -514,9 +524,7 @@ func (c *Workflow) processPacket(ctx context.Context, pkt Packet) bool {
 		end = c.handleReceived(ctx, pkt)
 	}
 	switch end {
-	case quitByReset:
-		return false
-	case quitByContext:
+	case quitByReset, quitByContext:
 		c.setState(ctx, stateIdle)
 		return false
 	case quitByUs, quitByPeer, quitByBoth:
