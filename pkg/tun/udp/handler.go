@@ -14,7 +14,12 @@ import (
 	"github.com/datawire/dlib/dlog"
 )
 
-type Handler struct {
+type DatagramHandler interface {
+	connpool.Handler
+	NewDatagram(ctx context.Context, dg Datagram)
+}
+
+type handler struct {
 	*connpool.Stream
 	id        connpool.ConnID
 	remove    func()
@@ -23,47 +28,36 @@ type Handler struct {
 	idleTimer *time.Timer
 }
 
-func (c *Handler) Close(_ context.Context) {
-}
-
 const ioChannelSize = 0x40
 const idleDuration = time.Second
 
-func (c *Handler) Run(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(ctx)
-	c.idleTimer = time.AfterFunc(idleDuration, func() {
-		c.remove()
-		cancel()
-	})
-	go c.writerLoop(ctx)
-	<-ctx.Done()
-}
-
-func (c *Handler) NewDatagram(ctx context.Context, dg Datagram) {
+func (c *handler) NewDatagram(ctx context.Context, dg Datagram) {
 	select {
 	case <-ctx.Done():
 	case c.fromTun <- dg:
 	}
 }
 
-func NewHandler(stream *connpool.Stream, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) *Handler {
-	return &Handler{
+func (c *handler) Close(_ context.Context) {
+}
+
+func NewHandler(ctx context.Context, wg *sync.WaitGroup,
+	stream *connpool.Stream, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) DatagramHandler {
+	h := &handler{
 		Stream:  stream,
 		id:      id,
 		toTun:   toTun,
 		remove:  remove,
 		fromTun: make(chan Datagram, ioChannelSize),
 	}
+	go h.run(ctx, wg, h.writeLoop)
+	return h
 }
 
-func (c *Handler) HandleControl(_ context.Context, _ *connpool.ControlMessage) {
-
+func (c *handler) HandleControl(_ context.Context, _ *connpool.ControlMessage) {
 }
 
-func (c *Handler) HandleMessage(ctx context.Context, mdg *manager.ConnMessage) {
+func (c *handler) HandleMessage(ctx context.Context, mdg *manager.ConnMessage) {
 	pkt := NewDatagram(HeaderLen+len(mdg.Payload), c.id.Destination(), c.id.Source())
 	ipHdr := pkt.IPHeader()
 	ipHdr.SetChecksum()
@@ -75,7 +69,6 @@ func (c *Handler) HandleMessage(ctx context.Context, mdg *manager.ConnMessage) {
 	copy(udpHdr.Payload(), mdg.Payload)
 	udpHdr.SetChecksum(ipHdr)
 
-	dlog.Debugf(ctx, "<- MGR %s", pkt)
 	select {
 	case <-ctx.Done():
 		return
@@ -83,7 +76,20 @@ func (c *Handler) HandleMessage(ctx context.Context, mdg *manager.ConnMessage) {
 	}
 }
 
-func (c *Handler) writerLoop(ctx context.Context) {
+func (c *handler) run(ctx context.Context, wg *sync.WaitGroup, writerLoop func(context.Context)) {
+	defer wg.Done()
+
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	c.idleTimer = time.AfterFunc(idleDuration, func() {
+		c.remove()
+		cancel()
+	})
+	go writerLoop(ctx)
+	<-ctx.Done()
+}
+
+func (c *handler) writeLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():

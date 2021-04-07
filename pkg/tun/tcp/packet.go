@@ -25,7 +25,7 @@ type packet struct {
 	withAck bool
 }
 
-func MakePacket(ipHdr ip.Header, data *buffer.Data) Packet {
+func PacketFromData(ipHdr ip.Header, data *buffer.Data) Packet {
 	return &packet{ipHdr: ipHdr, data: data}
 }
 

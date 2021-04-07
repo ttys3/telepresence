@@ -75,7 +75,14 @@ const (
 	quitByBoth
 )
 
-type Workflow struct {
+type PacketHandler interface {
+	connpool.Handler
+
+	// HandlePacket handles a packet that was read from the TUN device
+	HandlePacket(ctx context.Context, pkt Packet)
+}
+
+type handler struct {
 	*connpool.Stream
 
 	// id identifies this connection. It contains source and destination IPs and ports
@@ -123,8 +130,9 @@ type Workflow struct {
 	rcvWnd  int32
 }
 
-func NewWorkflow(tcpStream *connpool.Stream, dispatcherClosing *int32, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) *Workflow {
-	return &Workflow{
+func NewHandler(ctx context.Context, wg *sync.WaitGroup,
+	tcpStream *connpool.Stream, dispatcherClosing *int32, toTun chan<- ip.Packet, id connpool.ConnID, remove func()) PacketHandler {
+	h := &handler{
 		Stream:            tcpStream,
 		id:                id,
 		remove:            remove,
@@ -137,123 +145,125 @@ func NewWorkflow(tcpStream *connpool.Stream, dispatcherClosing *int32, toTun cha
 		rcvWnd:            int32(maxReceiveWindow),
 		wfState:           stateIdle,
 	}
+	go h.run(ctx, wg)
+	return h
 }
 
-func (c *Workflow) NewPacket(ctx context.Context, pkt Packet) {
+func (h *handler) HandlePacket(ctx context.Context, pkt Packet) {
 	select {
 	case <-ctx.Done():
-	case c.fromTun <- pkt:
+	case h.fromTun <- pkt:
 	}
 }
 
-func (c *Workflow) Run(ctx context.Context, wg *sync.WaitGroup) {
-	defer func() {
-		_ = c.sendConnControl(ctx, connpool.Disconnect)
-		c.remove()
-		wg.Done()
-	}()
-	go c.processResends(ctx)
-	c.processPackets(ctx)
-}
-
-func (c *Workflow) HandleControl(ctx context.Context, ctrl *connpool.ControlMessage) {
+func (h *handler) HandleControl(ctx context.Context, ctrl *connpool.ControlMessage) {
 	switch ctrl.Code {
 	case connpool.ConnectOK:
-		synPacket := c.synPacket
-		c.synPacket = nil
+		synPacket := h.synPacket
+		h.synPacket = nil
 		if synPacket != nil {
 			defer synPacket.Release()
-			c.sendSyn(ctx, synPacket)
+			h.sendSyn(ctx, synPacket)
 		}
 	case connpool.ConnectReject:
-		synPacket := c.synPacket
-		c.synPacket = nil
+		synPacket := h.synPacket
+		h.synPacket = nil
 		if synPacket != nil {
 			synPacket.Release()
 		}
 	}
 }
 
-func (c *Workflow) HandleMessage(ctx context.Context, cm *manager.ConnMessage) {
+func (h *handler) HandleMessage(ctx context.Context, cm *manager.ConnMessage) {
 	select {
 	case <-ctx.Done():
-	case c.fromMgr <- cm:
+	case h.fromMgr <- cm:
 	}
 }
 
-func (c *Workflow) Close(ctx context.Context) {
-	if c.state() == stateEstablished {
-		c.setState(ctx, stateFinWait1)
-		c.sendFin(ctx, true)
+func (h *handler) Close(ctx context.Context) {
+	if h.state() == stateEstablished {
+		h.setState(ctx, stateFinWait1)
+		h.sendFin(ctx, true)
 	}
 }
 
-func (c *Workflow) adjustReceiveWindow() {
-	queueSize := len(c.toMgr)
+func (h *handler) run(ctx context.Context, wg *sync.WaitGroup) {
+	defer func() {
+		_ = h.sendConnControl(ctx, connpool.Disconnect)
+		h.remove()
+		wg.Done()
+	}()
+	go h.processResends(ctx)
+	h.processPackets(ctx)
+}
+
+func (h *handler) adjustReceiveWindow() {
+	queueSize := len(h.toMgr)
 	windowSize := maxReceiveWindow
 	if queueSize > ioChannelSize/4 {
 		windowSize -= queueSize * (maxReceiveWindow / ioChannelSize)
 	}
-	c.setReceiveWindow(uint16(windowSize))
+	h.setReceiveWindow(uint16(windowSize))
 }
 
-func (c *Workflow) sendToMgr(ctx context.Context, pkt Packet) bool {
+func (h *handler) sendToMgr(ctx context.Context, pkt Packet) bool {
 	select {
-	case c.toMgr <- pkt:
-		c.adjustReceiveWindow()
+	case h.toMgr <- pkt:
+		h.adjustReceiveWindow()
 		return true
 	case <-ctx.Done():
 		return false
 	}
 }
 
-func (c *Workflow) sendToTun(ctx context.Context, pkt Packet) {
+func (h *handler) sendToTun(ctx context.Context, pkt Packet) {
 	select {
 	case <-ctx.Done():
-	case c.ToTun <- pkt:
+	case h.ToTun <- pkt:
 	}
 }
 
-func (c *Workflow) newResponse(ipPlayloadLen int, withAck bool) Packet {
-	pkt := NewPacket(ipPlayloadLen, c.id.Destination(), c.id.Source(), withAck)
+func (h *handler) newResponse(ipPlayloadLen int, withAck bool) Packet {
+	pkt := NewPacket(ipPlayloadLen, h.id.Destination(), h.id.Source(), withAck)
 	ipHdr := pkt.IPHeader()
 	ipHdr.SetL4Protocol(unix.IPPROTO_TCP)
 	ipHdr.SetChecksum()
 
 	tcpHdr := Header(ipHdr.Payload())
 	tcpHdr.SetDataOffset(5)
-	tcpHdr.SetSourcePort(c.id.DestinationPort())
-	tcpHdr.SetDestinationPort(c.id.SourcePort())
-	tcpHdr.SetWindowSize(c.receiveWindow())
+	tcpHdr.SetSourcePort(h.id.DestinationPort())
+	tcpHdr.SetDestinationPort(h.id.SourcePort())
+	tcpHdr.SetWindowSize(h.receiveWindow())
 	return pkt
 }
 
-func (c *Workflow) sendAck(ctx context.Context) {
-	pkt := c.newResponse(HeaderLen, false)
+func (h *handler) sendAck(ctx context.Context) {
+	pkt := h.newResponse(HeaderLen, false)
 	tcpHdr := pkt.Header()
 	tcpHdr.SetACK(true)
-	tcpHdr.SetSequence(c.sequence())
-	tcpHdr.SetAckNumber(c.sequenceLastAcked())
+	tcpHdr.SetSequence(h.sequence())
+	tcpHdr.SetAckNumber(h.sequenceLastAcked())
 	tcpHdr.SetChecksum(pkt.IPHeader())
-	c.sendToTun(ctx, pkt)
+	h.sendToTun(ctx, pkt)
 }
 
-func (c *Workflow) sendFin(ctx context.Context, expectAck bool) {
-	pkt := c.newResponse(HeaderLen, true)
+func (h *handler) sendFin(ctx context.Context, expectAck bool) {
+	pkt := h.newResponse(HeaderLen, true)
 	tcpHdr := pkt.Header()
 	tcpHdr.SetFIN(true)
 	tcpHdr.SetACK(true)
-	tcpHdr.SetSequence(c.sequence())
-	tcpHdr.SetAckNumber(c.sequenceLastAcked())
+	tcpHdr.SetSequence(h.sequence())
+	tcpHdr.SetAckNumber(h.sequenceLastAcked())
 	tcpHdr.SetChecksum(pkt.IPHeader())
 	if expectAck {
-		c.pushToAckWait(1, pkt)
-		c.finalSeq = c.sequence()
+		h.pushToAckWait(1, pkt)
+		h.finalSeq = h.sequence()
 	}
-	c.sendToTun(ctx, pkt)
+	h.sendToTun(ctx, pkt)
 }
 
-func (c *Workflow) sendSyn(ctx context.Context, syn Packet) {
+func (h *handler) sendSyn(ctx context.Context, syn Packet) {
 	synHdr := syn.Header()
 	if !synHdr.SYN() {
 		return
@@ -262,11 +272,11 @@ func (c *Workflow) sendSyn(ctx context.Context, syn Packet) {
 	if synHdr.ECE() {
 		hl += 4
 	}
-	pkt := c.newResponse(hl, true)
+	pkt := h.newResponse(hl, true)
 	tcpHdr := pkt.Header()
 	tcpHdr.SetSYN(true)
 	tcpHdr.SetACK(true)
-	tcpHdr.SetSequence(c.sequence())
+	tcpHdr.SetSequence(h.sequence())
 	tcpHdr.SetAckNumber(synHdr.Sequence() + 1)
 	if synHdr.ECE() {
 		tcpHdr.SetDataOffset(6)
@@ -277,23 +287,23 @@ func (c *Workflow) sendSyn(ctx context.Context, syn Packet) {
 	}
 	tcpHdr.SetChecksum(pkt.IPHeader())
 
-	c.setSequenceLastAcked(tcpHdr.AckNumber())
-	c.sendToTun(ctx, pkt)
-	c.pushToAckWait(1, pkt)
+	h.setSequenceLastAcked(tcpHdr.AckNumber())
+	h.sendToTun(ctx, pkt)
+	h.pushToAckWait(1, pkt)
 }
 
 // writeToTunLoop sends the packages read from the toMgr channel to the traffic-manager device
-func (c *Workflow) writeToMgrLoop(ctx context.Context) {
+func (h *handler) writeToMgrLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case pkt := <-c.toMgr:
-			c.adjustReceiveWindow()
+		case pkt := <-h.toMgr:
+			h.adjustReceiveWindow()
 			dlog.Debugf(ctx, "-> MGR %s", pkt)
-			err := c.SendMsg(&manager.ConnMessage{ConnId: []byte(c.id), Payload: pkt.Header().Payload()})
+			err := h.SendMsg(&manager.ConnMessage{ConnId: []byte(h.id), Payload: pkt.Header().Payload()})
 			if err != nil {
-				if ctx.Err() == nil && atomic.LoadInt32(c.dispatcherClosing) == 0 && c.state() < stateFinWait2 {
+				if ctx.Err() == nil && atomic.LoadInt32(h.dispatcherClosing) == 0 && h.state() < stateFinWait2 {
 					dlog.Errorf(ctx, "failed to write to dispatcher's remote endpoint: %v", err)
 				}
 				return
@@ -304,16 +314,16 @@ func (c *Workflow) writeToMgrLoop(ctx context.Context) {
 }
 
 // writeToTunLoop sends the packages read from the fromMgr channel to the TUN device
-func (c *Workflow) writeToTunLoop(ctx context.Context) {
+func (h *handler) writeToTunLoop(ctx context.Context) {
 	for {
-		window := c.sendWindow()
+		window := h.sendWindow()
 		if window == 0 {
 			// The intended receiver is currently not accepting data. We must
 			// wait for the window to increase.
-			dlog.Debugf(ctx, "%s TCP window is zero", c.id)
+			dlog.Debugf(ctx, "%s TCP window is zero", h.id)
 			for window == 0 {
 				dtime.SleepWithContext(ctx, 10*time.Microsecond)
-				window = c.sendWindow()
+				window = h.sendWindow()
 			}
 		}
 
@@ -321,10 +331,10 @@ func (c *Workflow) writeToTunLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case cm = <-c.fromMgr:
+		case cm = <-h.fromMgr:
 		}
 		n := len(cm.Payload)
-		pkt := c.newResponse(HeaderLen+n, true)
+		pkt := h.newResponse(HeaderLen+n, true)
 		ipHdr := pkt.IPHeader()
 		tcpHdr := pkt.Header()
 		ipHdr.SetPayloadLen(HeaderLen + n)
@@ -332,44 +342,44 @@ func (c *Workflow) writeToTunLoop(ctx context.Context) {
 
 		tcpHdr.SetACK(true)
 		tcpHdr.SetPSH(true)
-		tcpHdr.SetSequence(c.sequence())
-		tcpHdr.SetAckNumber(c.sequenceLastAcked())
+		tcpHdr.SetSequence(h.sequence())
+		tcpHdr.SetAckNumber(h.sequenceLastAcked())
 		copy(tcpHdr.Payload(), cm.Payload)
 		tcpHdr.SetChecksum(ipHdr)
 
-		c.sendToTun(ctx, pkt)
-		c.pushToAckWait(uint32(n), pkt)
+		h.sendToTun(ctx, pkt)
+		h.pushToAckWait(uint32(n), pkt)
 
 		// Decrease the window size with the bytes that we just sent unless it's already updated
 		// from a received package
 		window -= window - uint16(n)
-		atomic.CompareAndSwapInt32(&c.sendWnd, int32(window), int32(window))
+		atomic.CompareAndSwapInt32(&h.sendWnd, int32(window), int32(window))
 	}
 }
 
-func (c *Workflow) sendConnControl(ctx context.Context, code connpool.ControlCode) error {
-	pkt := connpool.ConnControl(c.id, code)
-	dlog.Debugf(ctx, "-> MGR %s, code %s", c.id, code)
-	if err := c.SendMsg(pkt); err != nil {
+func (h *handler) sendConnControl(ctx context.Context, code connpool.ControlCode) error {
+	pkt := connpool.ConnControl(h.id, code)
+	dlog.Debugf(ctx, "-> MGR %s, code %s", h.id, code)
+	if err := h.SendMsg(pkt); err != nil {
 		return fmt.Errorf("failed to send control package: %v", err)
 	}
 	return nil
 }
 
-func (c *Workflow) idle(ctx context.Context, syn Packet) quitReason {
-	c.synPacket = syn
-	if err := c.sendConnControl(ctx, connpool.Connect); err != nil {
+func (h *handler) idle(ctx context.Context, syn Packet) quitReason {
+	h.synPacket = syn
+	if err := h.sendConnControl(ctx, connpool.Connect); err != nil {
 		dlog.Error(ctx, err)
-		c.synPacket = nil
-		c.sendToTun(ctx, syn.Reset())
+		h.synPacket = nil
+		h.sendToTun(ctx, syn.Reset())
 		return quitByUs
 	}
-	c.setSequence(1)
-	c.setState(ctx, stateSynReceived)
+	h.setSequence(1)
+	h.setState(ctx, stateSynReceived)
 	return pleaseContinue
 }
 
-func (c *Workflow) synReceived(ctx context.Context, pkt Packet) quitReason {
+func (h *handler) synReceived(ctx context.Context, pkt Packet) quitReason {
 	release := true
 	defer func() {
 		if release {
@@ -385,17 +395,17 @@ func (c *Workflow) synReceived(ctx context.Context, pkt Packet) quitReason {
 		return pleaseContinue
 	}
 
-	c.ackReceived(tcpHdr.AckNumber())
-	c.setState(ctx, stateEstablished)
-	go c.writeToMgrLoop(ctx)
-	go c.writeToTunLoop(ctx)
+	h.ackReceived(tcpHdr.AckNumber())
+	h.setState(ctx, stateEstablished)
+	go h.writeToMgrLoop(ctx)
+	go h.writeToTunLoop(ctx)
 
 	pl := len(tcpHdr.Payload())
-	c.setSequenceLastAcked(tcpHdr.Sequence() + uint32(pl))
+	h.setSequenceLastAcked(tcpHdr.Sequence() + uint32(pl))
 	if pl != 0 {
-		c.setSequence(c.sequence() + uint32(pl))
-		c.pushToAckWait(uint32(pl), pkt)
-		if !c.sendToMgr(ctx, pkt) {
+		h.setSequence(h.sequence() + uint32(pl))
+		h.pushToAckWait(uint32(pl), pkt)
+		if !h.sendToMgr(ctx, pkt) {
 			return quitByContext
 		}
 		release = false
@@ -403,8 +413,8 @@ func (c *Workflow) synReceived(ctx context.Context, pkt Packet) quitReason {
 	return pleaseContinue
 }
 
-func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
-	state := c.state()
+func (h *handler) handleReceived(ctx context.Context, pkt Packet) quitReason {
+	state := h.state()
 	release := true
 	defer func() {
 		if release {
@@ -414,7 +424,7 @@ func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
 
 	tcpHdr := pkt.Header()
 	if tcpHdr.RST() {
-		c.setState(ctx, stateIdle)
+		h.setState(ctx, stateIdle)
 		return quitByReset
 	}
 
@@ -424,25 +434,25 @@ func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
 	}
 
 	ackNbr := tcpHdr.AckNumber()
-	c.ackReceived(ackNbr)
+	h.ackReceived(ackNbr)
 	if state == stateTimedWait {
-		c.setState(ctx, stateIdle)
+		h.setState(ctx, stateIdle)
 		return quitByPeer
 	}
 
 	sq := tcpHdr.Sequence()
-	lastAck := c.sequenceLastAcked()
+	lastAck := h.sequenceLastAcked()
 	switch {
 	case sq == lastAck:
-		if state == stateFinWait1 && ackNbr == c.finalSeq && !tcpHdr.FIN() {
-			c.setState(ctx, stateFinWait2)
+		if state == stateFinWait1 && ackNbr == h.finalSeq && !tcpHdr.FIN() {
+			h.setState(ctx, stateFinWait2)
 			return pleaseContinue
 		}
 	case sq > lastAck:
 		// Oops. Package loss! Let sender know by sending an ACK so that we ack the receipt
 		// and also tell the sender about our expected number
-		c.sendAck(ctx)
-		c.addOutOfOrderPackage(ctx, pkt)
+		h.sendAck(ctx)
+		h.addOutOfOrderPackage(ctx, pkt)
 		release = false
 		return pleaseContinue
 	default:
@@ -455,32 +465,32 @@ func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
 
 	switch {
 	case len(tcpHdr.Payload()) > 0:
-		c.setSequenceLastAcked(lastAck + uint32(len(tcpHdr.Payload())))
-		if !c.sendToMgr(ctx, pkt) {
+		h.setSequenceLastAcked(lastAck + uint32(len(tcpHdr.Payload())))
+		if !h.sendToMgr(ctx, pkt) {
 			return quitByContext
 		}
 		release = false
 	case tcpHdr.FIN():
-		c.setSequenceLastAcked(lastAck + 1)
+		h.setSequenceLastAcked(lastAck + 1)
 	default:
 		// don't ack acks
 		return pleaseContinue
 	}
-	c.sendAck(ctx)
+	h.sendAck(ctx)
 
 	switch state {
 	case stateEstablished:
 		if tcpHdr.FIN() {
-			c.sendFin(ctx, false)
-			c.setState(ctx, stateTimedWait)
+			h.sendFin(ctx, false)
+			h.setState(ctx, stateTimedWait)
 			return quitByPeer
 		}
 	case stateFinWait1:
 		if tcpHdr.FIN() {
-			c.setState(ctx, stateTimedWait)
+			h.setState(ctx, stateTimedWait)
 			return quitByBoth
 		}
-		c.setState(ctx, stateFinWait2)
+		h.setState(ctx, stateFinWait2)
 	case stateFinWait2:
 		if tcpHdr.FIN() {
 			return quitByUs
@@ -489,15 +499,15 @@ func (c *Workflow) handleReceived(ctx context.Context, pkt Packet) quitReason {
 	return pleaseContinue
 }
 
-func (c *Workflow) processPackets(ctx context.Context) {
+func (h *handler) processPackets(ctx context.Context) {
 	for {
 		select {
-		case pkt := <-c.fromTun:
-			if !c.processPacket(ctx, pkt) {
+		case pkt := <-h.fromTun:
+			if !h.processPacket(ctx, pkt) {
 				return
 			}
 			for {
-				continueProcessing, next := c.processNextOutOfOrderPackage(ctx)
+				continueProcessing, next := h.processNextOutOfOrderPackage(ctx)
 				if !continueProcessing {
 					return
 				}
@@ -506,32 +516,32 @@ func (c *Workflow) processPackets(ctx context.Context) {
 				}
 			}
 		case <-ctx.Done():
-			c.setState(ctx, stateIdle)
+			h.setState(ctx, stateIdle)
 			return
 		}
 	}
 }
 
-func (c *Workflow) processPacket(ctx context.Context, pkt Packet) bool {
-	c.setSendWindow(pkt.Header().WindowSize())
+func (h *handler) processPacket(ctx context.Context, pkt Packet) bool {
+	h.setSendWindow(pkt.Header().WindowSize())
 	var end quitReason
-	switch c.state() {
+	switch h.state() {
 	case stateIdle:
-		end = c.idle(ctx, pkt)
+		end = h.idle(ctx, pkt)
 	case stateSynReceived:
-		end = c.synReceived(ctx, pkt)
+		end = h.synReceived(ctx, pkt)
 	default:
-		end = c.handleReceived(ctx, pkt)
+		end = h.handleReceived(ctx, pkt)
 	}
 	switch end {
 	case quitByReset, quitByContext:
-		c.setState(ctx, stateIdle)
+		h.setState(ctx, stateIdle)
 		return false
 	case quitByUs, quitByPeer, quitByBoth:
 		func() {
 			ctx, cancel := context.WithTimeout(ctx, time.Second)
 			defer cancel()
-			c.processPackets(ctx)
+			h.processPackets(ctx)
 		}()
 		return false
 	default:
@@ -542,7 +552,7 @@ func (c *Workflow) processPacket(ctx context.Context, pkt Packet) bool {
 const initialResendDelay = 2
 const maxResends = 7
 
-func (c *Workflow) processResends(ctx context.Context) {
+func (h *handler) processResends(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
@@ -551,9 +561,9 @@ func (c *Workflow) processResends(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			c.ackWaitQueueLock.Lock()
+			h.ackWaitQueueLock.Lock()
 			var prev *queueElement
-			for el := c.ackWaitQueue; el != nil; {
+			for el := h.ackWaitQueue; el != nil; {
 				secs := initialResendDelay << el.retries // 2, 4, 8, 16, ...
 				deadLine := el.cTime.Add(time.Duration(secs) * time.Second)
 				if deadLine.Before(now) {
@@ -563,121 +573,121 @@ func (c *Workflow) processResends(ctx context.Context) {
 						// Drop from queue and point to next
 						el = el.next
 						if prev == nil {
-							c.ackWaitQueue = el
+							h.ackWaitQueue = el
 						} else {
 							prev.next = el
 						}
 						continue
 					}
 					dlog.Debugf(ctx, "Resending %s after having waited for %d seconds", el.packet, secs)
-					c.sendToTun(ctx, el.packet)
+					h.sendToTun(ctx, el.packet)
 				}
 				prev = el
 				el = el.next
 			}
-			c.ackWaitQueueLock.Unlock()
+			h.ackWaitQueueLock.Unlock()
 		}
 	}
 }
 
-func (c *Workflow) pushToAckWait(seqAdd uint32, pkt Packet) {
-	c.ackWaitQueueLock.Lock()
-	c.ackWaitQueue = &queueElement{
-		sequence: c.addSequence(seqAdd),
+func (h *handler) pushToAckWait(seqAdd uint32, pkt Packet) {
+	h.ackWaitQueueLock.Lock()
+	h.ackWaitQueue = &queueElement{
+		sequence: h.addSequence(seqAdd),
 		cTime:    time.Now(),
 		packet:   pkt,
-		next:     c.ackWaitQueue,
+		next:     h.ackWaitQueue,
 	}
-	c.ackWaitQueueLock.Unlock()
+	h.ackWaitQueueLock.Unlock()
 }
 
-func (c *Workflow) ackReceived(seq uint32) {
-	c.ackWaitQueueLock.Lock()
+func (h *handler) ackReceived(seq uint32) {
+	h.ackWaitQueueLock.Lock()
 	var prev *queueElement
-	for el := c.ackWaitQueue; el != nil && el.sequence <= seq; el = el.next {
+	for el := h.ackWaitQueue; el != nil && el.sequence <= seq; el = el.next {
 		if prev != nil {
 			prev.next = el.next
 		} else {
-			c.ackWaitQueue = el.next
+			h.ackWaitQueue = el.next
 		}
 		prev = el
 		el.packet.Release()
 	}
-	c.ackWaitQueueLock.Unlock()
+	h.ackWaitQueueLock.Unlock()
 }
 
-func (c *Workflow) processNextOutOfOrderPackage(ctx context.Context) (bool, bool) {
-	seq := c.sequenceLastAcked()
+func (h *handler) processNextOutOfOrderPackage(ctx context.Context) (bool, bool) {
+	seq := h.sequenceLastAcked()
 	var prev *queueElement
-	for el := c.oooQueue; el != nil; el = el.next {
+	for el := h.oooQueue; el != nil; el = el.next {
 		if el.sequence == seq {
 			if prev != nil {
 				prev.next = el.next
 			} else {
-				c.oooQueue = el.next
+				h.oooQueue = el.next
 			}
 			dlog.Debugf(ctx, "Processing out-of-order package %s", el.packet)
-			return c.processPacket(ctx, el.packet), true
+			return h.processPacket(ctx, el.packet), true
 		}
 		prev = el
 	}
 	return true, false
 }
 
-func (c *Workflow) addOutOfOrderPackage(ctx context.Context, pkt Packet) {
+func (h *handler) addOutOfOrderPackage(ctx context.Context, pkt Packet) {
 	dlog.Debugf(ctx, "Keeping out-of-order package %s", pkt)
-	c.oooQueue = &queueElement{
+	h.oooQueue = &queueElement{
 		sequence: pkt.Header().Sequence(),
 		cTime:    time.Now(),
 		packet:   pkt,
-		next:     c.oooQueue,
+		next:     h.oooQueue,
 	}
 }
 
-func (c *Workflow) state() state {
-	return state(atomic.LoadInt32((*int32)(&c.wfState)))
+func (h *handler) state() state {
+	return state(atomic.LoadInt32((*int32)(&h.wfState)))
 }
 
-func (c *Workflow) setState(_ context.Context, s state) {
+func (h *handler) setState(_ context.Context, s state) {
 	// dlog.Debugf(ctx, "state %s -> %s", c.state(), s)
-	atomic.StoreInt32((*int32)(&c.wfState), int32(s))
+	atomic.StoreInt32((*int32)(&h.wfState), int32(s))
 }
 
 // sequence is the sequence number of the packages that this client
 // sends to the TUN device.
-func (c *Workflow) sequence() uint32 {
-	return atomic.LoadUint32(&c.seq)
+func (h *handler) sequence() uint32 {
+	return atomic.LoadUint32(&h.seq)
 }
 
-func (c *Workflow) addSequence(v uint32) uint32 {
-	return atomic.AddUint32(&c.seq, v)
+func (h *handler) addSequence(v uint32) uint32 {
+	return atomic.AddUint32(&h.seq, v)
 }
 
-func (c *Workflow) setSequence(v uint32) {
-	atomic.StoreUint32(&c.seq, v)
+func (h *handler) setSequence(v uint32) {
+	atomic.StoreUint32(&h.seq, v)
 }
 
 // sequenceLastAcked is the last received sequence that this client has ACKed
-func (c *Workflow) sequenceLastAcked() uint32 {
-	return atomic.LoadUint32(&c.lastAck)
+func (h *handler) sequenceLastAcked() uint32 {
+	return atomic.LoadUint32(&h.lastAck)
 }
 
-func (c *Workflow) setSequenceLastAcked(v uint32) {
-	atomic.StoreUint32(&c.lastAck, v)
+func (h *handler) setSequenceLastAcked(v uint32) {
+	atomic.StoreUint32(&h.lastAck, v)
 }
 
-func (c *Workflow) sendWindow() uint16 {
-	return uint16(atomic.LoadInt32(&c.sendWnd))
+func (h *handler) sendWindow() uint16 {
+	return uint16(atomic.LoadInt32(&h.sendWnd))
 }
 
-func (c *Workflow) setSendWindow(v uint16) {
-	atomic.StoreInt32(&c.sendWnd, int32(v))
+func (h *handler) setSendWindow(v uint16) {
+	atomic.StoreInt32(&h.sendWnd, int32(v))
 }
 
-func (c *Workflow) receiveWindow() uint16 {
-	return uint16(atomic.LoadInt32(&c.rcvWnd))
+func (h *handler) receiveWindow() uint16 {
+	return uint16(atomic.LoadInt32(&h.rcvWnd))
 }
 
-func (c *Workflow) setReceiveWindow(v uint16) {
-	atomic.StoreInt32(&c.rcvWnd, int32(v))
+func (h *handler) setReceiveWindow(v uint16) {
+	atomic.StoreInt32(&h.rcvWnd, int32(v))
 }

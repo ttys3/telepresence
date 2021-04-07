@@ -92,7 +92,7 @@ func (d *Dispatcher) Run(c context.Context) error {
 			case <-c.Done():
 				return nil
 			case pkt := <-d.toTunCh:
-				dlog.Debugf(c, "-> TUN: %s", pkt)
+				dlog.Debugf(c, "-> TUN %s", pkt)
 				_, err := d.dev.Write(pkt.Data())
 				pkt.SoftRelease()
 				if err != nil {
@@ -164,36 +164,32 @@ func (d *Dispatcher) handlePacket(c context.Context, data *buffer.Data) {
 		}
 	}()
 
-	hdr, err := ip.ParseHeader(data.Buf())
+	ipHdr, err := ip.ParseHeader(data.Buf())
 	if err != nil {
 		dlog.Error(c, "Unable to parse package header")
 		return
 	}
 
-	if hdr.PayloadLen() > buffer.DataPool.MTU-hdr.HeaderLen() {
+	if ipHdr.PayloadLen() > buffer.DataPool.MTU-ipHdr.HeaderLen() {
 		// Package is too large for us.
-		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, icmp.MustFragment)
+		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.MustFragment)
 		return
 	}
 
-	if hdr.Version() == ipv6.Version {
-		dlog.Error(c, "IPv6 is not yet handled by this dispatcher")
-		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, 0) // 0 == ICMPv6 code "no route to destination"
-		return
-	}
-
-	ipHdr := hdr.(ip.V4Header)
-	if ipHdr.Flags()&ipv4.MoreFragments != 0 || ipHdr.FragmentOffset() != 0 {
-		data = ipHdr.ConcatFragments(data, d.fragmentMap)
-		if data == nil {
-			return
+	if ipHdr.Version() == ipv4.Version {
+		v4Hdr := ipHdr.(ip.V4Header)
+		if v4Hdr.Flags()&ipv4.MoreFragments != 0 || v4Hdr.FragmentOffset() != 0 {
+			data = v4Hdr.ConcatFragments(data, d.fragmentMap)
+			if data == nil {
+				return
+			}
+			v4Hdr = data.Buf()
 		}
-		ipHdr = data.Buf()
-	}
+	} // TODO: similar for ipv6 using segments
 
 	switch ipHdr.L4Protocol() {
 	case unix.IPPROTO_TCP:
-		d.tcp(c, tcp.MakePacket(ipHdr, data))
+		d.tcp(c, tcp.PacketFromData(ipHdr, data))
 		data = nil
 	case unix.IPPROTO_UDP:
 		dst := ipHdr.Destination()
@@ -204,23 +200,23 @@ func (d *Dispatcher) handlePacket(c context.Context, data *buffer.Data) {
 		if ip4 := dst.To4(); ip4 != nil && ip4[2] == 0 && ip4[3] == 0 {
 			// Write to the a subnet's zero address. Not sure why this is happening but there's no point in
 			// passing them on.
-			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, icmp.HostUnreachable)
+			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.HostUnreachable)
 			return
 		}
-		dg := udp.MakeDatagram(ipHdr, data)
+		dg := udp.DatagramFromData(ipHdr, data)
 		if blockedUDPPorts[dg.Header().SourcePort()] || blockedUDPPorts[dg.Header().DestinationPort()] {
-			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, icmp.PortUnreachable)
+			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.PortUnreachable)
 			return
 		}
 		data = nil
 		d.udp(c, dg)
 	case unix.IPPROTO_ICMP:
 	case unix.IPPROTO_ICMPV6:
-		pkt := icmp.MakePacket(ipHdr, data)
+		pkt := icmp.PacketFromData(ipHdr, data)
 		dlog.Debugf(c, "<- TUN %s", pkt)
 	default:
 		// An L4 protocol that we don't handle.
-		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), hdr, icmp.ProtocolUnreachable)
+		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.ProtocolUnreachable)
 	}
 }
 
@@ -240,16 +236,14 @@ func (d *Dispatcher) tcp(c context.Context, pkt tcp.Packet) {
 			case d.toTunCh <- pkt.Reset():
 			}
 		}
-		wf := tcp.NewWorkflow(d.connStream, &d.closing, d.toTunCh, connID, remove)
 		d.handlersWg.Add(1)
-		go wf.Run(c, &d.handlersWg)
-		return wf, nil
+		return tcp.NewHandler(c, &d.handlersWg, d.connStream, &d.closing, d.toTunCh, connID, remove), nil
 	})
 	if err != nil {
 		dlog.Error(c, err)
 		return
 	}
-	wf.(*tcp.Workflow).NewPacket(c, pkt)
+	wf.(tcp.PacketHandler).HandlePacket(c, pkt)
 }
 
 func (d *Dispatcher) udp(c context.Context, dg udp.Datagram) {
@@ -257,17 +251,15 @@ func (d *Dispatcher) udp(c context.Context, dg udp.Datagram) {
 	ipHdr := dg.IPHeader()
 	udpHdr := dg.Header()
 	connID := connpool.NewConnID(unix.IPPROTO_UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
-	uh, err := d.handlers.Get(c, connID, func(c context.Context, release func()) (connpool.Handler, error) {
-		handler := udp.NewHandler(d.connStream, d.toTunCh, connID, release)
+	uh, err := d.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		d.handlersWg.Add(1)
-		go handler.Run(c, &d.handlersWg)
-		return handler, nil
+		return udp.NewHandler(c, &d.handlersWg, d.connStream, d.toTunCh, connID, remove), nil
 	})
 	if err != nil {
 		dlog.Error(c, err)
 		return
 	}
-	uh.(*udp.Handler).NewDatagram(c, dg)
+	uh.(udp.DatagramHandler).NewDatagram(c, dg)
 }
 
 func (d *Dispatcher) AddSubnets(c context.Context, subnets []*net.IPNet) error {
