@@ -9,12 +9,12 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 
 	"github.com/datawire/dlib/dgroup"
 	"github.com/datawire/dlib/dlog"
+	"github.com/telepresenceio/telepresence/rpc/v2/daemon"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
@@ -33,6 +33,9 @@ type Dispatcher struct {
 	handlersWg    sync.WaitGroup
 	toTunCh       chan ip.Packet
 	fragmentMap   map[uint16][]*buffer.Data
+	dnsIP         net.IP
+	dnsPort       uint16
+	dnsLocalAddr  *net.UDPAddr
 	closing       int32
 	mgrConfigured <-chan struct{}
 }
@@ -47,6 +50,16 @@ func NewDispatcher(dev *Device, managerConfigured <-chan struct{}) *Dispatcher {
 	}
 }
 
+func (d *Dispatcher) Device() *Device {
+	return d.dev
+}
+
+func (d *Dispatcher) ConfigureDNS(ctx context.Context, dnsIP net.IP, dnsPort uint16, dnsLocalAddr *net.UDPAddr) error {
+	d.dnsIP = dnsIP
+	d.dnsPort = dnsPort
+	d.dnsLocalAddr = dnsLocalAddr
+	return nil
+}
 
 func (d *Dispatcher) SetManagerInfo(ctx context.Context, mi *daemon.ManagerInfo) (err error) {
 	if d.managerClient == nil {
@@ -253,6 +266,9 @@ func (d *Dispatcher) udp(c context.Context, dg udp.Datagram) {
 	connID := connpool.NewConnID(unix.IPPROTO_UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
 	uh, err := d.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		d.handlersWg.Add(1)
+		if udpHdr.DestinationPort() == d.dnsPort && ipHdr.Destination().Equal(d.dnsIP) {
+			return udp.NewDnsInterceptor(c, &d.handlersWg, d.connStream, d.toTunCh, connID, remove, d.dnsLocalAddr)
+		}
 		return udp.NewHandler(c, &d.handlersWg, d.connStream, d.toTunCh, connID, remove), nil
 	})
 	if err != nil {
