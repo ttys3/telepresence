@@ -40,10 +40,8 @@ func (s *Stream) ReadLoop(ctx context.Context) error {
 			dlog.Debugf(ctx, "<- MGR %s, code %s", ctrl.ID.ReplyString(), ctrl.Code)
 			if conn, _ := s.pool.Get(ctx, ctrl.ID, nil); conn != nil {
 				conn.HandleControl(ctx, ctrl)
-			} else {
-				if ctrl.Code != ReadClosed && ctrl.Code != DisconnectOK {
-					dlog.Error(ctx, "control packet lost because no connection was active")
-				}
+			} else if ctrl.Code != ReadClosed && ctrl.Code != DisconnectOK {
+				dlog.Error(ctx, "control packet lost because no connection was active")
 			}
 			continue
 		}

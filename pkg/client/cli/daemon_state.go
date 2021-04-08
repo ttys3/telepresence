@@ -63,7 +63,7 @@ func (ds *daemonState) EnsureState() (bool, error) {
 		_ = lf.Close()
 	}
 
-	err = runAsRoot(client.GetExe(), []string{"daemon-foreground", logDir, dnsIP, fallbackIP})
+	err = runAsRoot(client.GetExe(), []string{"daemon-foreground", logDir, dnsIP})
 	if err != nil {
 		return false, errors.Wrap(err, "failed to launch the server")
 	}

@@ -4,7 +4,7 @@ import (
 	"sync"
 )
 
-const defaultMTU = 1500
+const defaultMTU = 0xffff
 const maxIPHeader = 60
 
 // A Pool is a specialized sync.Pool for Data. The Data struct is platform specific
