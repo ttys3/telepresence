@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
@@ -241,9 +242,15 @@ func (d *tunRouter) setManagerInfo(ctx context.Context, mi *daemon.ManagerInfo) 
 }
 
 func (d *tunRouter) stop(c context.Context) {
-	atomic.StoreInt32(&d.closing, 1)
-	d.handlers.CloseAll(c)
-	d.handlersWg.Wait()
+	cc, cancel := context.WithTimeout(c, 2*time.Second)
+	defer cancel()
+	go func() {
+		atomic.StoreInt32(&d.closing, 1)
+		d.handlers.CloseAll(cc)
+		d.handlersWg.Wait()
+		cancel()
+	}()
+	<-cc.Done()
 	atomic.StoreInt32(&d.closing, 2)
 	d.dev.Close()
 }
