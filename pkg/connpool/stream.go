@@ -3,6 +3,7 @@ package connpool
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/datawire/dlib/dlog"
 
@@ -22,14 +23,17 @@ func NewStream(bidiStream grpc.ClientStream, pool *Pool) *Stream {
 
 // ReadLoop reads replies from the stream and dispatches them to the correct connection
 // based on the message id.
-func (s *Stream) ReadLoop(ctx context.Context) error {
-	for {
+func (s *Stream) ReadLoop(ctx context.Context, closing *int32) error {
+	for atomic.LoadInt32(closing) == 0 {
 		cm := new(manager.ConnMessage)
 		err := s.RecvMsg(cm)
-
 		if err != nil {
-			return fmt.Errorf("read from grpc.ClientStream failed: %s", err)
+			if atomic.LoadInt32(closing) == 0 && ctx.Err() == nil {
+				return fmt.Errorf("read from grpc.ClientStream failed: %s", err)
+			}
+			return nil
 		}
+
 		if IsControlMessage(cm) {
 			ctrl, err := NewControlMessage(cm)
 			if err != nil {
@@ -51,4 +55,5 @@ func (s *Stream) ReadLoop(ctx context.Context) error {
 			conn.HandleMessage(ctx, cm)
 		}
 	}
+	return nil
 }
