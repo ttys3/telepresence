@@ -1,7 +1,6 @@
 // Package subnet contains functions for finding available subnets
 package subnet
 
-import "C"
 import (
 	"bytes"
 	"errors"
@@ -44,12 +43,12 @@ func AnalyzeIPs(ips []net.IP) []*net.IPNet {
 	for _, ip := range ips {
 		if ip4 := ip.To4(); ip4 != nil {
 			bk := ipv4SubnetKey{ip4[0], ip4[1]}
-			var bytes *ByteSet
-			if bytes = ipv4Subnets[bk]; bytes == nil {
-				bytes = &ByteSet{}
-				ipv4Subnets[bk] = bytes
+			var bts *ByteSet
+			if bts = ipv4Subnets[bk]; bts == nil {
+				bts = &ByteSet{}
+				ipv4Subnets[bk] = bts
 			}
-			bytes.Add(ip4[2])
+			bts.Add(ip4[2])
 		} else if ip16 := ip.To16(); ip16 != nil {
 			r := ipv6SubnetKey{}
 			copy(r[:], ip16)
@@ -66,8 +65,8 @@ func AnalyzeIPs(ips []net.IP) []*net.IPNet {
 
 	subnets := make([]*net.IPNet, len(ipv4Subnets)+len(ipv6Subnets))
 	i := 0
-	for network, bytes := range ipv4Subnets {
-		ones, thirdByte := bytes.Mask()
+	for network, bts := range ipv4Subnets {
+		ones, thirdByte := bts.Mask()
 		subnets[i] = &net.IPNet{
 			IP:   net.IP{network[0], network[1], thirdByte, 0},
 			Mask: net.CIDRMask(16+ones, 32),
@@ -78,8 +77,8 @@ func AnalyzeIPs(ips []net.IP) []*net.IPNet {
 		maskOnes := 64
 		ip := make(net.IP, 16)
 		copy(ip, subnet[:])
-		for bi, bytes := range byteSets {
-			ones, nByte := bytes.Mask()
+		for bi, bts := range byteSets {
+			ones, nByte := bts.Mask()
 			maskOnes += ones
 			ip[8+bi] = nByte
 			if ones != 8 {

@@ -21,10 +21,48 @@ const (
 	hiPort = 8000
 )
 
-type SessionState struct {
-	Done       <-chan struct{}
-	Cancel     context.CancelFunc
-	LastMarked time.Time
+type SessionState interface {
+	Cancel()
+	Done() <-chan struct{}
+	LastMarked() time.Time
+	SetLastMarked(lastMarked time.Time)
+}
+
+type sessionState struct {
+	done       <-chan struct{}
+	cancel     context.CancelFunc
+	lastMarked time.Time
+}
+
+type agentSessionState struct {
+	sessionState
+	agent           *rpc.AgentInfo
+	lookups         chan *rpc.LookupHostRequest
+	lookupResponses map[string]chan *rpc.LookupHostResponse
+}
+
+func (ss *sessionState) Cancel() {
+	ss.cancel()
+}
+
+func (ss *sessionState) Done() <-chan struct{} {
+	return ss.done
+}
+
+func (ss *sessionState) LastMarked() time.Time {
+	return ss.lastMarked
+}
+
+func (ss *sessionState) SetLastMarked(lastMarked time.Time) {
+	ss.lastMarked = lastMarked
+}
+
+func (ss *agentSessionState) Cancel() {
+	close(ss.lookups)
+	for _, lr := range ss.lookupResponses {
+		close(lr)
+	}
+	ss.sessionState.Cancel()
 }
 
 // State is the total state of the Traffic Manager.  A zero State is invalid; you must call
@@ -49,7 +87,7 @@ type State struct {
 	intercepts   watchable.InterceptMap
 	agents       watchable.AgentMap                   // info for agent sessions
 	clients      watchable.ClientMap                  // info for client sessions
-	sessions     map[string]*SessionState             // info for all sessions
+	sessions     map[string]SessionState              // info for all sessions
 	agentsByName map[string]map[string]*rpc.AgentInfo // indexed copy of `agents`
 }
 
@@ -57,7 +95,7 @@ func NewState(ctx context.Context) *State {
 	return &State{
 		ctx:          ctx,
 		port:         loPort - 1,
-		sessions:     make(map[string]*SessionState),
+		sessions:     make(map[string]SessionState),
 		agentsByName: make(map[string]map[string]*rpc.AgentInfo),
 	}
 }
@@ -166,7 +204,7 @@ func (s *State) MarkSession(req *rpc.RemainRequest, now time.Time) (ok bool) {
 	sessionID := req.Session.SessionId
 
 	if sess, ok := s.sessions[sessionID]; ok {
-		sess.LastMarked = now
+		sess.SetLastMarked(now)
 		if req.ApiKey != "" {
 			if client, ok := s.clients.Load(sessionID); ok {
 				client.ApiKey = req.ApiKey
@@ -231,7 +269,7 @@ func (s *State) ExpireSessions(moment time.Time) {
 	defer s.mu.Unlock()
 
 	for id, sess := range s.sessions {
-		if sess.LastMarked.Before(moment) {
+		if sess.LastMarked().Before(moment) {
 			s.unlockedRemoveSession(id)
 		}
 	}
@@ -249,7 +287,7 @@ func (s *State) SessionDone(id string) <-chan struct{} {
 		close(ret)
 		return ret
 	}
-	return sess.Done
+	return sess.Done()
 }
 
 // Sessions: Clients ///////////////////////////////////////////////////////////////////////////////
@@ -272,10 +310,10 @@ func (s *State) addClient(sessionID string, client *rpc.ClientInfo, now time.Tim
 		panic(fmt.Errorf("duplicate id %q, existing %+v, new %+v", sessionID, oldClient, client))
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	s.sessions[sessionID] = &SessionState{
-		Done:       ctx.Done(),
-		Cancel:     cancel,
-		LastMarked: now,
+	s.sessions[sessionID] = &sessionState{
+		done:       ctx.Done(),
+		cancel:     cancel,
+		lastMarked: now,
 	}
 	return sessionID
 }
@@ -331,10 +369,15 @@ func (s *State) AddAgent(agent *rpc.AgentInfo, now time.Time) string {
 	}
 	s.agentsByName[agent.Name][sessionID] = agent
 	ctx, cancel := context.WithCancel(s.ctx)
-	s.sessions[sessionID] = &SessionState{
-		Done:       ctx.Done(),
-		Cancel:     cancel,
-		LastMarked: now,
+	s.sessions[sessionID] = &agentSessionState{
+		sessionState: sessionState{
+			done:       ctx.Done(),
+			cancel:     cancel,
+			lastMarked: now,
+		},
+		lookups:         make(chan *rpc.LookupHostRequest),
+		lookupResponses: make(map[string]chan *rpc.LookupHostResponse),
+		agent:           agent,
 	}
 	return sessionID
 }
@@ -348,13 +391,15 @@ func (s *State) GetAllAgents() map[string]*rpc.AgentInfo {
 	return s.agents.LoadAll()
 }
 
-func (s *State) GetAgentsByName(name string) map[string]*rpc.AgentInfo {
+func (s *State) GetAgentsByName(name, namespace string) map[string]*rpc.AgentInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ret := make(map[string]*rpc.AgentInfo, len(s.agentsByName[name]))
 	for k, v := range s.agentsByName[name] {
-		ret[k] = proto.Clone(v).(*rpc.AgentInfo)
+		if v.Namespace == namespace {
+			ret[k] = proto.Clone(v).(*rpc.AgentInfo)
+		}
 	}
 
 	return ret
@@ -417,6 +462,26 @@ func (s *State) AddIntercept(sessionID string, spec *rpc.InterceptSpec) (*rpc.In
 	return cept, nil
 }
 
+func (s *State) GetAgentsInterceptedByClient(client string) (agentSessionIDs []string) {
+	for _, intercept := range s.intercepts.LoadAll() {
+		if intercept.Disposition != rpc.InterceptDispositionType_ACTIVE {
+			continue
+		}
+		spec := intercept.Spec
+		if spec.Client != client {
+			continue
+		}
+		s.mu.Lock()
+		for asi, agent := range s.sessions {
+			if as, ok := agent.(*agentSessionState); ok && as.agent.Name == spec.Agent && as.agent.Namespace == spec.Namespace {
+				agentSessionIDs = append(agentSessionIDs, asi)
+			}
+		}
+		s.mu.Unlock()
+	}
+	return agentSessionIDs
+}
+
 // UpdateIntercept applies a given mutator function to the stored intercept with interceptID;
 // storing and returning the result.  If the given intercept does not exist, then the mutator
 // function is not run, and nil is returned.
@@ -462,4 +527,62 @@ func (s *State) WatchIntercepts(
 	} else {
 		return s.intercepts.SubscribeSubset(ctx, filter)
 	}
+}
+
+// PostLookupResponse receives lookup responses from an agent and places them in the channel
+// that corresponds to the lookup request
+func (s *State) PostLookupResponse(response *rpc.LookupHostAgentResponse) {
+	responseID := response.Request.Session.SessionId + ":" + response.Request.Host
+	var rch chan<- *rpc.LookupHostResponse
+	s.mu.Lock()
+	if as, ok := s.sessions[response.Session.SessionId].(*agentSessionState); ok {
+		rch = as.lookupResponses[responseID]
+	}
+	s.mu.Unlock()
+	if rch != nil {
+		rch <- response.Response
+	}
+}
+
+func (s *State) StartHostLookup(agentSessionID string, request *rpc.LookupHostRequest) <-chan *rpc.LookupHostResponse {
+	responseID := request.Session.SessionId + ":" + request.Host
+	var (
+		rch chan *rpc.LookupHostResponse
+		as  *agentSessionState
+		ok  bool
+	)
+	s.mu.Lock()
+	if as, ok = s.sessions[agentSessionID].(*agentSessionState); ok {
+		if rch, ok = as.lookupResponses[responseID]; !ok {
+			rch = make(chan *rpc.LookupHostResponse)
+			as.lookupResponses[responseID] = rch
+		}
+	}
+	s.mu.Unlock()
+	if as != nil {
+		as.lookups <- request
+	}
+	return rch
+}
+
+func (s *State) EndHostLookup(agentSessionID string, request *rpc.LookupHostRequest) {
+	responseID := request.Session.SessionId + ":" + request.Host
+	s.mu.Lock()
+	if as, ok := s.sessions[agentSessionID].(*agentSessionState); ok {
+		if rch, ok := as.lookupResponses[responseID]; ok {
+			delete(as.lookupResponses, responseID)
+			close(rch)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *State) WatchLookupHost(agentSessionID string) <-chan *rpc.LookupHostRequest {
+	s.mu.Lock()
+	ss, ok := s.sessions[agentSessionID]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return ss.(*agentSessionState).lookups
 }

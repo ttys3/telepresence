@@ -1,16 +1,18 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/telepresenceio/telepresence/v2/pkg/iputil"
+
+	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 
 	"github.com/datawire/dlib/dlog"
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/daemon"
@@ -18,26 +20,6 @@ import (
 )
 
 const kubernetesZone = "cluster.local"
-
-type IPs []net.IP
-
-func (ips IPs) String() string {
-	nips := len(ips)
-	switch nips {
-	case 0:
-		return ""
-	case 1:
-		return ips[0].String()
-	default:
-		sb := strings.Builder{}
-		sb.WriteString(ips[0].String())
-		for i := 1; i < nips; i++ {
-			sb.WriteByte(',')
-			sb.WriteString(ips[i].String())
-		}
-		return sb.String()
-	}
-}
 
 // outbound does stuff, idk, I didn't write it.
 //
@@ -50,7 +32,7 @@ type outbound struct {
 
 	// Namespaces, accessible using <service-name>.<namespace-name>
 	namespaces map[string]struct{}
-	domains    map[string]IPs
+	domains    map[string]iputil.IPs
 	search     []string
 
 	// managerConfigured is closed when the traffic manager has performed
@@ -75,6 +57,10 @@ type outbound struct {
 	setSearchPathFunc func(c context.Context, paths []string)
 
 	work chan func(context.Context) error
+
+	// dnsQueriesInProgress unique set of DNS queries currently in progress.
+	dnsQueriesInProgress map[string]struct{}
+	dnsQueriesLock       sync.Mutex
 }
 
 // splitToUDPAddr splits the given address into an UDPAddr. It's
@@ -109,23 +95,18 @@ func newOutbound(c context.Context, dnsIPStr string, noSearch bool) (*outbound, 
 	// seed random generator (used when shuffling IPs)
 	rand.Seed(time.Now().UnixNano())
 
-	var dnsIP net.IP
-	if dnsIP = net.ParseIP(dnsIPStr); dnsIP != nil {
-		if ip4 := dnsIP.To4(); ip4 != nil {
-			dnsIP = ip4
-		}
-	}
 	ret := &outbound{
-		dnsListener:       listener,
-		dnsIP:             dnsIP,
-		noSearch:          noSearch,
-		namespaces:        make(map[string]struct{}),
-		domains:           make(map[string]IPs),
-		search:            []string{""},
-		work:              make(chan func(context.Context) error),
-		dnsConfigured:     make(chan struct{}),
-		managerConfigured: make(chan struct{}),
-		kubeDNS:           make(chan net.IP, 1),
+		dnsListener:          listener,
+		dnsIP:                iputil.Parse(dnsIPStr),
+		noSearch:             noSearch,
+		namespaces:           make(map[string]struct{}),
+		domains:              make(map[string]iputil.IPs),
+		dnsQueriesInProgress: make(map[string]struct{}),
+		search:               []string{""},
+		work:                 make(chan func(context.Context) error),
+		dnsConfigured:        make(chan struct{}),
+		managerConfigured:    make(chan struct{}),
+		kubeDNS:              make(chan net.IP, 1),
 	}
 
 	if ret.router, err = newTunRouter(ret.managerConfigured); err != nil {
@@ -158,46 +139,56 @@ func (o *outbound) routerServerWorker(c context.Context) (err error) {
 // change during a session, a stable fake domain is needed to emulate the search-path. That fake-domain can then be used
 // in the search path declared in the Docker config. The "tel2-search" domain fills this purpose and a request for
 // "<single label name>.tel2-search." will be resolved as "<single label name>." using the search path of this resolver.
-const tel2SubDomain = "tel2-search"
+const tel2SubDomain = ".tel2-search"
 
-func (o *outbound) resolveNoSearch(query string) []net.IP {
-	query = strings.ToLower(query)
-	ds := strings.Split(query, ".")
-	dl := len(ds) - 1 // -1 to encounter for ending dot.
-	if dl < 1 {
-		// bogus name, give up.
-		return nil
-	}
-	rhsDomain := ds[dl-1]
+func (o *outbound) resolveInCluster(c context.Context, query string) []net.IP {
+	query = query[:len(query)-1]
+	query = strings.ToLower(query) // strip of trailing dot
+	query = strings.TrimSuffix(query, tel2SubDomain)
 
-	o.domainsLock.RLock()
-	defer o.domainsLock.RUnlock()
-	if dl == 2 && rhsDomain == tel2SubDomain { // only for single label names with namespace, hence dl == 2
-		return o.resolveWithSearchLocked(ds[0] + ".")
-	}
-	if _, ok := o.namespaces[rhsDomain]; ok {
-		// This is a <subdomain>.<namespace> query
-		query += "svc.cluster.local."
-	}
-	ips := o.domains[query]
-	return shuffleIPs(ips)
-}
-
-func (o *outbound) resolveWithSearchLocked(n string) []net.IP {
-	for _, p := range o.search {
-		if ips, ok := o.domains[n+p]; ok {
-			return shuffleIPs(ips)
+	o.dnsQueriesLock.Lock()
+	for qip := range o.dnsQueriesInProgress {
+		if strings.HasPrefix(query, qip) && strings.Contains(query, "."+kubernetesZone) {
+			// This is most likely a recursion caused by the query in progress. This happens when a cluster
+			// runs locally on the same host as Telepresence and falls back to use the DNS of that host when
+			// the query cannot be resolved in the cluster. Sending that query to the traffic-manager is
+			// pointless so we end the recursion here.
+			o.dnsQueriesLock.Unlock()
+			return nil
 		}
 	}
-	return nil
+	o.dnsQueriesInProgress[query] = struct{}{}
+	o.dnsQueriesLock.Unlock()
+
+	defer func() {
+		o.dnsQueriesLock.Lock()
+		delete(o.dnsQueriesInProgress, query)
+		o.dnsQueriesLock.Unlock()
+	}()
+	response, err := o.router.managerClient.LookupHost(c, &manager.LookupHostRequest{
+		Session: o.router.session,
+		Host:    query,
+	})
+	if err != nil {
+		dlog.Error(c, err)
+		return nil
+	}
+	if len(response.Ips) == 0 {
+		return nil
+	}
+	ips := make(iputil.IPs, len(response.Ips))
+	for i, ip := range response.Ips {
+		ips[i] = ip
+	}
+	return ips
 }
 
 // Since headless and externalName services can have multiple IPs,
 // we return a shuffled list of the IPs if there are more than one.
-func shuffleIPs(ips IPs) IPs {
+func shuffleIPs(ips iputil.IPs) iputil.IPs {
 	switch lenIPs := len(ips); lenIPs {
 	case 0:
-		return IPs{}
+		return iputil.IPs{}
 	case 1:
 	default:
 		// If there are multiple elements in the slice, we shuffle the
@@ -219,15 +210,11 @@ func (o *outbound) setManagerInfo(c context.Context, info *rpc.ManagerInfo) erro
 func (o *outbound) update(_ context.Context, table *rpc.Table) (err error) {
 	// o.proxy.SetSocksPort(table.SocksPort)
 	ips := make(map[IPKey]struct{}, len(table.Routes))
-	domains := make(map[string]IPs)
+	domains := make(map[string]iputil.IPs)
 	for _, route := range table.Routes {
-		dIps := make(IPs, 0, len(route.Ips))
+		dIps := make(iputil.IPs, 0, len(route.Ips))
 		for _, ipStr := range route.Ips {
-			if ip := net.ParseIP(ipStr); ip != nil {
-				// ParseIP returns ipv4 that are 16 bytes long. Normalize them into 4 bytes
-				if ip4 := ip.To4(); ip4 != nil {
-					ip = ip4
-				}
+			if ip := iputil.Parse(ipStr); ip != nil {
 				dIps = append(dIps, ip)
 				ips[IPKey(ip)] = struct{}{}
 			}
@@ -247,26 +234,7 @@ func (o *outbound) noMoreUpdates() {
 	close(o.work)
 }
 
-func (ips IPs) uniqueSorted() IPs {
-	sort.Slice(ips, func(i, j int) bool {
-		return bytes.Compare(ips[i], ips[j]) < 0
-	})
-	var prev net.IP
-	last := len(ips) - 1
-	for i := 0; i <= last; i++ {
-		s := ips[i]
-		if s.Equal(prev) {
-			copy(ips[i:], ips[i+1:])
-			last--
-			i--
-		} else {
-			prev = s
-		}
-	}
-	return ips[:last+1]
-}
-
-func (o *outbound) doUpdate(c context.Context, domains map[string]IPs, table map[IPKey]struct{}) error {
+func (o *outbound) doUpdate(c context.Context, domains map[string]iputil.IPs, table map[IPKey]struct{}) error {
 	// We're updating routes. Make sure DNS waits until the new answer
 	// is ready, i.e. don't serve old answers.
 	o.domainsLock.Lock()
@@ -284,7 +252,7 @@ func (o *outbound) doUpdate(c context.Context, domains map[string]IPs, table map
 	var kubeDNS net.IP
 	for k, nIps := range domains {
 		// Ensure that all added entries contain unique, sorted, and non-empty IPs
-		nIps = nIps.uniqueSorted()
+		nIps = nIps.UniqueSorted()
 		if len(nIps) == 0 {
 			delete(domains, k)
 			continue

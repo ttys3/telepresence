@@ -247,7 +247,7 @@ func (o *outbound) dnsServerWorker(c context.Context) error {
 	g := dgroup.NewGroup(c, dgroup.GroupConfig{})
 	g.Go("Server", func(c context.Context) error {
 		defer o.dnsListener.Close()
-		v := dns.NewServer(c, []net.PacketConn{o.dnsListener}, nil, o.resolveNoSearch)
+		v := dns.NewServer(c, []net.PacketConn{o.dnsListener}, nil, o.resolveInCluster)
 		return v.Run(c)
 	})
 	dns.Flush(c)

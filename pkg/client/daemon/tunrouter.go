@@ -107,6 +107,9 @@ type tunRouter struct {
 	//   2 = closed
 	closing int32
 
+	// session contains the manager session
+	session *manager.SessionInfo
+
 	// mgrConfigured will be closed as soon as the connector has sent over the correct port to
 	// the traffic manager and the managerClient has been connected.
 	mgrConfigured <-chan struct{}
@@ -164,8 +167,8 @@ func (t *tunRouter) flush(c context.Context, dnsIP net.IP) error {
 	addedNets := make(map[string]*net.IPNet)
 	ips := make([]net.IP, len(t.ips))
 	i := 0
-	for ip := range t.ips {
-		ips[i] = net.IP(ip)
+	for tip := range t.ips {
+		ips[i] = net.IP(tip)
 		i++
 	}
 
@@ -222,15 +225,15 @@ func (t *tunRouter) flush(c context.Context, dnsIP net.IP) error {
 	return nil
 }
 
-func (d *tunRouter) configureDNS(_ context.Context, dnsIP net.IP, dnsPort uint16, dnsLocalAddr *net.UDPAddr) error {
-	d.dnsIP = dnsIP
-	d.dnsPort = dnsPort
-	d.dnsLocalAddr = dnsLocalAddr
+func (t *tunRouter) configureDNS(_ context.Context, dnsIP net.IP, dnsPort uint16, dnsLocalAddr *net.UDPAddr) error {
+	t.dnsIP = dnsIP
+	t.dnsPort = dnsPort
+	t.dnsLocalAddr = dnsLocalAddr
 	return nil
 }
 
-func (d *tunRouter) setManagerInfo(ctx context.Context, mi *daemon.ManagerInfo) (err error) {
-	if d.managerClient == nil {
+func (t *tunRouter) setManagerInfo(ctx context.Context, mi *daemon.ManagerInfo) (err error) {
+	if t.managerClient == nil {
 		// First check. Establish connection
 		tos := &client.GetConfig(ctx).Timeouts
 		tc, cancel := context.WithTimeout(ctx, tos.TrafficManagerAPI)
@@ -244,23 +247,24 @@ func (d *tunRouter) setManagerInfo(ctx context.Context, mi *daemon.ManagerInfo) 
 		if err != nil {
 			return client.CheckTimeout(tc, &tos.TrafficManagerAPI, err)
 		}
-		d.managerClient = manager.NewManagerClient(conn)
+		t.session = mi.Session
+		t.managerClient = manager.NewManagerClient(conn)
 	}
 	return nil
 }
 
-func (d *tunRouter) stop(c context.Context) {
+func (t *tunRouter) stop(c context.Context) {
 	cc, cancel := context.WithTimeout(c, 2*time.Second)
 	defer cancel()
 	go func() {
-		atomic.StoreInt32(&d.closing, 1)
-		d.handlers.CloseAll(cc)
-		d.handlersWg.Wait()
+		atomic.StoreInt32(&t.closing, 1)
+		t.handlers.CloseAll(cc)
+		t.handlersWg.Wait()
 		cancel()
 	}()
 	<-cc.Done()
-	atomic.StoreInt32(&d.closing, 2)
-	d.dev.Close()
+	atomic.StoreInt32(&t.closing, 2)
+	t.dev.Close()
 }
 
 var blockedUDPPorts = map[uint16]bool{
@@ -269,21 +273,21 @@ var blockedUDPPorts = map[uint16]bool{
 	139: true, // NETBIOS
 }
 
-func (d *tunRouter) run(c context.Context) error {
+func (t *tunRouter) run(c context.Context) error {
 	g := dgroup.NewGroup(c, dgroup.GroupConfig{})
 
 	// writer
 	g.Go("TUN writer", func(c context.Context) error {
-		for atomic.LoadInt32(&d.closing) < 2 {
+		for atomic.LoadInt32(&t.closing) < 2 {
 			select {
 			case <-c.Done():
 				return nil
-			case pkt := <-d.toTunCh:
+			case pkt := <-t.toTunCh:
 				dlog.Debugf(c, "-> TUN %s", pkt)
-				_, err := d.dev.Write(pkt.Data())
+				_, err := t.dev.Write(pkt.Data())
 				pkt.SoftRelease()
 				if err != nil {
-					if atomic.LoadInt32(&d.closing) == 2 || c.Err() != nil {
+					if atomic.LoadInt32(&t.closing) == 2 || c.Err() != nil {
 						err = nil
 					}
 					return err
@@ -298,17 +302,17 @@ func (d *tunRouter) run(c context.Context) error {
 		select {
 		case <-c.Done():
 			return nil
-		case <-d.mgrConfigured:
+		case <-t.mgrConfigured:
 		}
 
 		// TODO: ConnTunnel should probably provide a sessionID
-		tunnel, err := d.managerClient.ConnTunnel(c)
+		tunnel, err := t.managerClient.ConnTunnel(c)
 		if err != nil {
 			return err
 		}
-		d.connStream = connpool.NewStream(tunnel, d.handlers)
+		t.connStream = connpool.NewStream(tunnel, t.handlers)
 		dlog.Debug(c, "MGR read loop starting")
-		return d.connStream.ReadLoop(c, &d.closing)
+		return t.connStream.ReadLoop(c, &t.closing)
 	})
 
 	g.Go("TUN reader", func(c context.Context) error {
@@ -316,17 +320,17 @@ func (d *tunRouter) run(c context.Context) error {
 		select {
 		case <-c.Done():
 			return nil
-		case <-d.mgrConfigured:
+		case <-t.mgrConfigured:
 		}
 
 		dlog.Debug(c, "TUN read loop starting")
-		for atomic.LoadInt32(&d.closing) < 2 {
+		for atomic.LoadInt32(&t.closing) < 2 {
 			data := buffer.DataPool.Get(buffer.DataPool.MTU)
 			for {
-				n, err := d.dev.Read(data)
+				n, err := t.dev.Read(data)
 				if err != nil {
 					buffer.DataPool.Put(data)
-					if c.Err() != nil || atomic.LoadInt32(&d.closing) == 2 {
+					if c.Err() != nil || atomic.LoadInt32(&t.closing) == 2 {
 						return nil
 					}
 					return fmt.Errorf("read packet error: %v", err)
@@ -336,14 +340,14 @@ func (d *tunRouter) run(c context.Context) error {
 					break
 				}
 			}
-			d.handlePacket(c, data)
+			t.handlePacket(c, data)
 		}
 		return nil
 	})
 	return g.Wait()
 }
 
-func (d *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
+func (t *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 	defer func() {
 		if data != nil {
 			buffer.DataPool.Put(data)
@@ -358,14 +362,14 @@ func (d *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 
 	if ipHdr.PayloadLen() > buffer.DataPool.MTU-ipHdr.HeaderLen() {
 		// Package is too large for us.
-		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.MustFragment)
+		t.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.MustFragment)
 		return
 	}
 
 	if ipHdr.Version() == ipv4.Version {
 		v4Hdr := ipHdr.(ip.V4Header)
 		if v4Hdr.Flags()&ipv4.MoreFragments != 0 || v4Hdr.FragmentOffset() != 0 {
-			data = v4Hdr.ConcatFragments(data, d.fragmentMap)
+			data = v4Hdr.ConcatFragments(data, t.fragmentMap)
 			if data == nil {
 				return
 			}
@@ -375,7 +379,7 @@ func (d *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 
 	switch ipHdr.L4Protocol() {
 	case unix.IPPROTO_TCP:
-		d.tcp(c, tcp.PacketFromData(ipHdr, data))
+		t.tcp(c, tcp.PacketFromData(ipHdr, data))
 		data = nil
 	case unix.IPPROTO_UDP:
 		dst := ipHdr.Destination()
@@ -386,32 +390,32 @@ func (d *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 		if ip4 := dst.To4(); ip4 != nil && ip4[2] == 0 && ip4[3] == 0 {
 			// Write to the a subnet's zero address. Not sure why this is happening but there's no point in
 			// passing them on.
-			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.HostUnreachable)
+			t.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.HostUnreachable)
 			return
 		}
 		dg := udp.DatagramFromData(ipHdr, data)
 		if blockedUDPPorts[dg.Header().SourcePort()] || blockedUDPPorts[dg.Header().DestinationPort()] {
-			d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.PortUnreachable)
+			t.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.PortUnreachable)
 			return
 		}
 		data = nil
-		d.udp(c, dg)
+		t.udp(c, dg)
 	case unix.IPPROTO_ICMP:
 	case unix.IPPROTO_ICMPV6:
 		pkt := icmp.PacketFromData(ipHdr, data)
 		dlog.Debugf(c, "<- TUN %s", pkt)
 	default:
 		// An L4 protocol that we don't handle.
-		d.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.ProtocolUnreachable)
+		t.toTunCh <- icmp.DestinationUnreachablePacket(uint16(buffer.DataPool.MTU), ipHdr, icmp.ProtocolUnreachable)
 	}
 }
 
-func (d *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
+func (t *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 	dlog.Debugf(c, "<- TUN %s", pkt)
 	ipHdr := pkt.IPHeader()
 	tcpHdr := pkt.Header()
 	connID := connpool.NewConnID(unix.IPPROTO_TCP, ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
-	wf, err := d.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
+	wf, err := t.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		if tcpHdr.RST() {
 			return nil, errors.New("dispatching got RST without connection workflow")
 		}
@@ -419,11 +423,11 @@ func (d *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 			select {
 			case <-c.Done():
 				return nil, c.Err()
-			case d.toTunCh <- pkt.Reset():
+			case t.toTunCh <- pkt.Reset():
 			}
 		}
-		d.handlersWg.Add(1)
-		return tcp.NewHandler(c, &d.handlersWg, d.connStream, &d.closing, d.toTunCh, connID, remove), nil
+		t.handlersWg.Add(1)
+		return tcp.NewHandler(c, &t.handlersWg, t.connStream, &t.closing, t.toTunCh, connID, remove), nil
 	})
 	if err != nil {
 		dlog.Error(c, err)
@@ -432,17 +436,17 @@ func (d *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 	wf.(tcp.PacketHandler).HandlePacket(c, pkt)
 }
 
-func (d *tunRouter) udp(c context.Context, dg udp.Datagram) {
+func (t *tunRouter) udp(c context.Context, dg udp.Datagram) {
 	dlog.Debugf(c, "<- TUN %s", dg)
 	ipHdr := dg.IPHeader()
 	udpHdr := dg.Header()
 	connID := connpool.NewConnID(unix.IPPROTO_UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
-	uh, err := d.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
-		d.handlersWg.Add(1)
-		if udpHdr.DestinationPort() == d.dnsPort && ipHdr.Destination().Equal(d.dnsIP) {
-			return udp.NewDnsInterceptor(c, &d.handlersWg, d.connStream, d.toTunCh, connID, remove, d.dnsLocalAddr)
+	uh, err := t.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
+		t.handlersWg.Add(1)
+		if udpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
+			return udp.NewDnsInterceptor(c, &t.handlersWg, t.connStream, t.toTunCh, connID, remove, t.dnsLocalAddr)
 		}
-		return udp.NewHandler(c, &d.handlersWg, d.connStream, d.toTunCh, connID, remove), nil
+		return udp.NewHandler(c, &t.handlersWg, t.connStream, t.toTunCh, connID, remove), nil
 	})
 	if err != nil {
 		dlog.Error(c, err)
