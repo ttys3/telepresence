@@ -470,6 +470,10 @@ func (m *Manager) LookupHost(ctx context.Context, request *rpc.LookupHostRequest
 				case <-agentTimeout.Done():
 					return
 				case rs := <-rsCh:
+					if rs == nil {
+						// Channel closed
+						return
+					}
 					rsMu.Lock()
 					responseCount++
 					rc := responseCount

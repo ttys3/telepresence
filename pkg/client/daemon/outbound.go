@@ -139,12 +139,13 @@ func (o *outbound) routerServerWorker(c context.Context) (err error) {
 // change during a session, a stable fake domain is needed to emulate the search-path. That fake-domain can then be used
 // in the search path declared in the Docker config. The "tel2-search" domain fills this purpose and a request for
 // "<single label name>.tel2-search." will be resolved as "<single label name>." using the search path of this resolver.
-const tel2SubDomain = ".tel2-search"
+const tel2SubDomain = "tel2-search"
+const dotTel2SubDomain = "." + tel2SubDomain
 
 func (o *outbound) resolveInCluster(c context.Context, query string) []net.IP {
 	query = query[:len(query)-1]
 	query = strings.ToLower(query) // strip of trailing dot
-	query = strings.TrimSuffix(query, tel2SubDomain)
+	query = strings.TrimSuffix(query, dotTel2SubDomain)
 
 	o.dnsQueriesLock.Lock()
 	for qip := range o.dnsQueriesInProgress {
