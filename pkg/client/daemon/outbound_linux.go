@@ -23,6 +23,11 @@ import (
 var errResolveDNotConfigured = errors.New("resolved not configured")
 
 func (o *outbound) dnsServerWorker(c context.Context) error {
+	if runningInDocker() {
+		// Don't bother with systemd-resolved when running in a docker container
+		return o.runOverridingServer(dgroup.WithGoroutineName(c, "/docker"))
+	}
+
 	err := o.tryResolveD(dgroup.WithGoroutineName(c, "/resolved"), o.router.dev)
 	if err == errResolveDNotConfigured {
 		dlog.Info(c, "Unable to use systemd-resolved, falling back to local server")
@@ -103,9 +108,14 @@ func (o *outbound) runOverridingServer(c context.Context) error {
 	return err
 }
 
+func runningInDocker() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
+}
+
 func (o *outbound) dnsListeners(c context.Context) ([]net.PacketConn, error) {
 	listeners := []net.PacketConn{o.dnsListener}
-	if _, err := os.Stat("/.dockerenv"); err == nil {
+	if runningInDocker() {
 		// Inside docker. Don't add docker bridge
 		return listeners, nil
 	}
