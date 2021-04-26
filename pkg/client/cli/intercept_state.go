@@ -216,7 +216,7 @@ func (ii *interceptInfo) intercept(cmd *cobra.Command, args []string) error {
 			if ii.dockerRun {
 				return is.runInDocker(cmd, args)
 			}
-			return start(cmd.Context(), args[0], args[1:], true, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), envPairs(is.env)...)
+			return cliutil.Start(cmd.Context(), args[0], args[1:], true, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), cliutil.EnvPairs(is.env)...)
 		})
 	})
 }
@@ -612,7 +612,7 @@ func (is *interceptState) runInDocker(cmd *cobra.Command, args []string) error {
 	if dockerMount != "" {
 		ourArgs = append(ourArgs, "-v", fmt.Sprintf("%s:%s", is.mountPoint, dockerMount))
 	}
-	return start(cmd.Context(), "docker", append(ourArgs, args...), true, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+	return cliutil.Start(cmd.Context(), "docker", append(ourArgs, args...), true, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
 }
 
 func (is *interceptState) writeEnvFile() error {

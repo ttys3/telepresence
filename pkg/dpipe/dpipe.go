@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync/atomic"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/datawire/dlib/dexec"
 	"github.com/datawire/dlib/dlog"
@@ -34,7 +33,7 @@ func DPipe(ctx context.Context, cmd *dexec.Cmd, peer io.ReadWriteCloser) error {
 		<-ctx.Done()
 		atomic.StoreInt32(&closing, 1)
 		_ = peer.Close()
-		_ = cmd.Process.Signal(unix.SIGTERM)
+		_ = cmd.Process.Signal(os.Interrupt)
 	}()
 
 	go func() {

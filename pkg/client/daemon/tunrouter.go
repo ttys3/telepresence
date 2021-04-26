@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 
 	"github.com/datawire/dlib/dgroup"
@@ -18,6 +17,7 @@ import (
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
+	"github.com/telepresenceio/telepresence/v2/pkg/ipproto"
 	"github.com/telepresenceio/telepresence/v2/pkg/iputil"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun/buffer"
@@ -163,7 +163,7 @@ func (t *tunRouter) stop(c context.Context) {
 	}()
 	<-cc.Done()
 	atomic.StoreInt32(&t.closing, 2)
-	t.dev.Close()
+	_ = t.dev.Close()
 }
 
 var blockedUDPPorts = map[uint16]bool{
@@ -283,10 +283,10 @@ func (t *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 	} // TODO: similar for ipv6 using segments
 
 	switch ipHdr.L4Protocol() {
-	case unix.IPPROTO_TCP:
+	case ipproto.TCP:
 		t.tcp(c, tcp.PacketFromData(ipHdr, data))
 		data = nil
-	case unix.IPPROTO_UDP:
+	case ipproto.UDP:
 		dst := ipHdr.Destination()
 		if dst.IsLinkLocalUnicast() || dst.IsLinkLocalMulticast() {
 			// Just ignore at this point.
@@ -305,8 +305,8 @@ func (t *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 		}
 		data = nil
 		t.udp(c, dg)
-	case unix.IPPROTO_ICMP:
-	case unix.IPPROTO_ICMPV6:
+	case ipproto.ICMP:
+	case ipproto.ICMPV6:
 		pkt := icmp.PacketFromData(ipHdr, data)
 		dlog.Debugf(c, "<- TUN %s", pkt)
 	default:
@@ -318,7 +318,7 @@ func (t *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 func (t *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 	ipHdr := pkt.IPHeader()
 	tcpHdr := pkt.Header()
-	connID := connpool.NewConnID(unix.IPPROTO_TCP, ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
+	connID := connpool.NewConnID(ipproto.TCP, ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
 	wf, _, err := t.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		return tcp.NewHandler(t.connStream, &t.closing, t.toTunCh, connID, remove), nil
 	})
@@ -332,7 +332,7 @@ func (t *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 func (t *tunRouter) udp(c context.Context, dg udp.Datagram) {
 	ipHdr := dg.IPHeader()
 	udpHdr := dg.Header()
-	connID := connpool.NewConnID(unix.IPPROTO_UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
+	connID := connpool.NewConnID(ipproto.UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
 	uh, _, err := t.handlers.Get(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
 		if udpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
 			return udp.NewDnsInterceptor(t.connStream, t.toTunCh, connID, remove, t.dnsLocalAddr)

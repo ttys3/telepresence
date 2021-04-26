@@ -143,7 +143,7 @@ func OpenRotatingFile(
 		return nil, err
 	}
 
-	rf.birthTime = getSysInfo(info).birthtime()
+	rf.birthTime = getSysInfo(logfileDir, info).birthtime()
 	rf.size = info.Size()
 
 	// Open existing file for append
@@ -243,7 +243,7 @@ func (rf *RotatingFile) openNew() (err error) {
 		if prevStat, err = rf.file.Stat(); err != nil {
 			return err
 		}
-		prevInfo := getSysInfo(prevStat)
+		prevInfo := getSysInfo(filepath.Dir(rf.dirName), prevStat)
 
 		// Open file with a different name so that a tail -F on the original doesn't fail with a permission denied
 		tmp := fullPath + ".tmp"
@@ -258,7 +258,7 @@ func (rf *RotatingFile) openNew() (err error) {
 			return err
 		}
 
-		if !prevInfo.haveSameOwnerAndGroup(getSysInfo(stat)) {
+		if !prevInfo.haveSameOwnerAndGroup(getSysInfo(rf.dirName, stat)) {
 			if err = prevInfo.setOwnerAndGroup(tmp); err != nil {
 				_ = os.Remove(tmp)
 				return err

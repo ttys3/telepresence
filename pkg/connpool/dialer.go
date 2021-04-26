@@ -7,10 +7,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/datawire/dlib/dlog"
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/manager"
+	"github.com/telepresenceio/telepresence/v2/pkg/ipproto"
 )
 
 // The idleDuration controls how long a dialer for a specific proto+from-to address combination remains alive without
@@ -76,7 +75,7 @@ func (h *dialer) Start(ctx context.Context) {
 
 	switch h.connected {
 	case notConnected:
-		if h.id.Protocol() == unix.IPPROTO_UDP {
+		if h.id.Protocol() == ipproto.UDP {
 			h.open(ctx)
 		}
 	case halfConnected:
@@ -164,7 +163,7 @@ func (h *dialer) readLoop(ctx context.Context) {
 		n, err := h.conn.Read(b)
 		if err != nil {
 			if atomic.LoadInt32(&h.connected) > 0 && ctx.Err() == nil {
-				if h.id.Protocol() == unix.IPPROTO_TCP {
+				if h.id.Protocol() == ipproto.TCP {
 					h.sendTCD(ctx, ReadClosed)
 				}
 				dlog.Errorf(ctx, "!! CONN %s, conn read: %v", h.id, err)
@@ -205,7 +204,7 @@ func (h *dialer) writeLoop(ctx context.Context) {
 				wn, err := h.conn.Write(dg.Payload[n:])
 				if err != nil {
 					if atomic.LoadInt32(&h.connected) > 0 && ctx.Err() == nil {
-						if h.id.Protocol() == unix.IPPROTO_TCP {
+						if h.id.Protocol() == ipproto.TCP {
 							h.sendTCD(ctx, WriteClosed)
 						}
 						dlog.Errorf(ctx, "!! CONN %s, write: %v", h.id, err)

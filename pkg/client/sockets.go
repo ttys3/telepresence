@@ -9,14 +9,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-const (
-	// ConnectorSocketName is the path used when communicating to the connector process
-	ConnectorSocketName = "/tmp/telepresence-connector.socket"
-
-	// DaemonSocketName is the path used when communicating to the daemon process
-	DaemonSocketName = "/var/run/telepresence-daemon.socket"
-)
-
 // SocketExists returns true if a socket is found at the given path
 func SocketExists(path string) bool {
 	s, err := os.Stat(path)

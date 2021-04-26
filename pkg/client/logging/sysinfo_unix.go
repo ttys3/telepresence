@@ -1,16 +1,17 @@
-// +build linux darwin
+// +build !windows
 
 package logging
 
 import (
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-type unixSysInfo syscall.Stat_t
+type unixSysInfo unix.Stat_t
 
-func getSysInfo(info os.FileInfo) sysinfo {
-	return (*unixSysInfo)(info.Sys().(*syscall.Stat_t))
+func getSysInfo(_ string, info os.FileInfo) sysinfo {
+	return (*unixSysInfo)(info.Sys().(*unix.Stat_t))
 }
 
 func (u *unixSysInfo) setOwnerAndGroup(name string) error {

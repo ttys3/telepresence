@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/client/cli/cliutil"
+
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	empty "google.golang.org/protobuf/types/known/emptypb"
@@ -63,13 +65,13 @@ func (ds *daemonState) EnsureState() (bool, error) {
 		_ = lf.Close()
 	}
 
-	err = runAsRoot(ds.cmd.Context(), client.GetExe(), []string{"daemon-foreground", logDir, dnsIP})
+	err = cliutil.RunAsRoot(ds.cmd.Context(), client.GetExe(), []string{"daemon-foreground", logDir, dnsIP})
 	if err != nil {
 		return false, errors.Wrap(err, "failed to launch the server")
 	}
 
 	if err = client.WaitUntilSocketAppears("daemon", client.DaemonSocketName, 10*time.Second); err != nil {
-		return false, fmt.Errorf("daemon service did not start (see %s for more info)", logFile)
+		return false, fmt.Errorf("daemon service did not Start (see %s for more info)", logFile)
 	}
 	err = ds.connect()
 	return err == nil, err
