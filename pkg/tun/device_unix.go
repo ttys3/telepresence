@@ -3,10 +3,16 @@
 package tun
 
 import (
+	"context"
+	"net"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+func (t *Device) SetDNS(_ context.Context, server net.IP, domains []string) (err error) {
+	// DNS is configured by other means than through the actual device
+}
 
 func withSocket(domain int, f func(fd int) error) error {
 	fd, err := unix.Socket(domain, unix.SOCK_DGRAM, 0)

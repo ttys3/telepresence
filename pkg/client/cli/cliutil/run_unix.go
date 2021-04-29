@@ -11,13 +11,15 @@ import (
 	"os/signal"
 	"strings"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/proc"
+
 	"golang.org/x/sys/unix"
 
 	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
 )
 
 func RunAsRoot(ctx context.Context, exe string, args []string) error {
-	if os.Geteuid() != 0 {
+	if !proc.IsAdmin() {
 		if err := exec.Command("sudo", "-n", "true").Run(); err != nil {
 			fmt.Printf("Need root privileges to run %q\n", logging.ShellString(exe, args))
 			if err = exec.Command("sudo", "true").Run(); err != nil {

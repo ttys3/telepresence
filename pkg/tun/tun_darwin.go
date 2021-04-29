@@ -26,7 +26,7 @@ type Device struct {
 }
 
 // OpenTun creates a new TUN device and ensures that it is up and running.
-func OpenTun() (*Device, error) {
+func OpenTun(_ context.Context) (*Device, error) {
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, sysProtoControl)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open DGRAM socket: %v", err)

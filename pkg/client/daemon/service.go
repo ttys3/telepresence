@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/proc"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -59,11 +61,16 @@ func Command() *cobra.Command {
 	return &cobra.Command{
 		Use:    processName + "-foreground",
 		Short:  "Launch Telepresence " + titleName + " in the foreground (debug)",
-		Args:   cobra.ExactArgs(2),
+		Args:   cobra.RangeArgs(1, 2),
 		Hidden: true,
 		Long:   help,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(cmd.Context(), args[0], args[1])
+			logDir := args[0]
+			dns := ""
+			if len(args) > 1 {
+				dns = args[1]
+			}
+			return run(cmd.Context(), logDir, dns)
 		},
 	}
 }
@@ -98,8 +105,8 @@ func (d *service) SetOutboundInfo(_ context.Context, info *rpc.OutboundInfo) (*e
 
 // run is the main function when executing as the daemon
 func run(c context.Context, loggingDir, dns string) error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("telepresence %s must run as root", processName)
+	if !proc.IsAdmin() {
+		return fmt.Errorf("telepresence %s must run with elevated privileges", processName)
 	}
 
 	// Spoof the AppUserLogDir so that it returns the original user's logging dir rather than
@@ -194,13 +201,9 @@ func run(c context.Context, loggingDir, dns string) error {
 		// Listen on unix domain socket
 		dlog.Debug(c, "Server starting")
 		d.callCtx = c
-		listener, err = net.Listen("unix", client.DaemonSocketName)
+		listener, err = client.ListenSocket(c, client.DaemonSocketName)
 		if err != nil {
 			return errors.Wrap(err, "listen")
-		}
-		err = os.Chmod(client.DaemonSocketName, 0777)
-		if err != nil {
-			return errors.Wrap(err, "chmod")
 		}
 
 		svc := grpc.NewServer()

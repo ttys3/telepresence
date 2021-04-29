@@ -10,15 +10,15 @@ import (
 
 type unixSysInfo unix.Stat_t
 
-func getSysInfo(_ string, info os.FileInfo) sysinfo {
+func GetSysInfo(_ string, info os.FileInfo) SysInfo {
 	return (*unixSysInfo)(info.Sys().(*unix.Stat_t))
 }
 
-func (u *unixSysInfo) setOwnerAndGroup(name string) error {
+func (u *unixSysInfo) SetOwnerAndGroup(name string) error {
 	return os.Chown(name, int(u.Uid), int(u.Gid))
 }
 
-func (u *unixSysInfo) haveSameOwnerAndGroup(other sysinfo) bool {
+func (u *unixSysInfo) HaveSameOwnerAndGroup(other SysInfo) bool {
 	ou := other.(*unixSysInfo)
 	return u.Uid == ou.Uid && u.Gid == ou.Gid
 }

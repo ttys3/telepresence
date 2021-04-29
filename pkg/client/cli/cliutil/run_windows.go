@@ -10,15 +10,26 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/telepresenceio/telepresence/v2/pkg/proc"
+	"golang.org/x/sys/windows"
+
 	"github.com/telepresenceio/telepresence/v2/pkg/client/logging"
 )
 
 func RunAsRoot(ctx context.Context, exe string, args []string) error {
-	if os.Geteuid() != 0 {
-		args = append([]string{`/user:administrator`, exe}, args...)
-		exe = "runas"
+	if proc.IsAdmin() {
+		return Start(ctx, exe, args, false, nil, nil, nil)
 	}
-	return Start(ctx, exe, args, false, nil, nil, nil)
+	cwd, _ := os.Getwd()
+	verbPtr, _ := windows.UTF16PtrFromString("runas")
+	exePtr, _ := windows.UTF16PtrFromString(exe)
+	cwdPtr, _ := windows.UTF16PtrFromString(cwd)
+	var argPtr *uint16
+	if len(args) > 0 {
+		argsStr := logging.ShellArgsString(args)
+		argPtr, _ = windows.UTF16PtrFromString(argsStr)
+	}
+	return windows.ShellExecute(0, verbPtr, exePtr, argPtr, cwdPtr, windows.SW_HIDE)
 }
 
 func Start(ctx context.Context, exe string, args []string, wait bool, stdin io.Reader, stdout, stderr io.Writer, env ...string) error {

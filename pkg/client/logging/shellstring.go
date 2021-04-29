@@ -15,6 +15,17 @@ func ShellString(exe string, args []string) string {
 	return b.String()
 }
 
+func ShellArgsString(args []string) string {
+	b := strings.Builder{}
+	for i, a := range args {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(quoteArg(a))
+	}
+	return b.String()
+}
+
 var escape = regexp.MustCompile(`[^\w!%+,\-./:=@^]`)
 
 // quoteArg checks if the give string contains characters that have special meaning for a

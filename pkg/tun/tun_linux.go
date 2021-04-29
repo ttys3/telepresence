@@ -23,7 +23,7 @@ type Device struct {
 }
 
 // OpenTun creates a new TUN device and ensures that it is up and running.
-func OpenTun() (*Device, error) {
+func OpenTun(_ context.Context) (*Device, error) {
 	// https://www.kernel.org/doc/Documentation/networking/tuntap.txt
 
 	fd, err := unix.Open(devicePath, unix.O_RDWR, 0)

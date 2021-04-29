@@ -1,17 +1,56 @@
 package client
 
 import (
-	"os"
-	"path/filepath"
+	"context"
+	"net"
+
+	"golang.org/x/sys/windows"
+
+	"github.com/telepresenceio/telepresence/v2/pkg/proc"
+
+	"github.com/Microsoft/go-winio"
+	"google.golang.org/grpc"
 )
 
-// ConnectorSocketName is the path used when communicating to the connector process
-var ConnectorSocketName string
+const (
+	// ConnectorSocketName is the path used when communicating to the connector process
+	ConnectorSocketName = `\\.\pipe\telepresence-connector`
 
-// DaemonSocketName is the path used when communicating to the daemon process
-var DaemonSocketName string
+	// DaemonSocketName is the path used when communicating to the daemon process
+	DaemonSocketName = `\\.\pipe\telepresence-daemon`
+)
 
-func init() {
-	ConnectorSocketName = filepath.Join(os.TempDir(), "telepresence-connector.socket")
-	DaemonSocketName = filepath.Join(os.TempDir(), "telepresence-daemon.socket")
+// DialSocket dials the given named pipet and returns the resulting connection
+func DialSocket(c context.Context, socketName string) (*grpc.ClientConn, error) {
+	return grpc.DialContext(c, socketName, grpc.WithInsecure(), grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
+		return winio.DialPipeContext(c, socketName)
+	}))
+}
+
+const AllowEveryone = "S:(ML;;NW;;;LW)D:(A;;0x12019f;;;WD)"
+
+// ListenSocket returns a listener for the given named pipe and returns the resulting connection
+func ListenSocket(_ context.Context, socketName string) (net.Listener, error) {
+	var config *winio.PipeConfig
+	if proc.IsAdmin() {
+		config = &winio.PipeConfig{SecurityDescriptor: AllowEveryone}
+	}
+	return winio.ListenPipe(socketName, config)
+}
+
+// SocketExists returns true if a socket is found at the given path
+func SocketExists(path string) bool {
+	uPath, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return false
+	}
+	h, err := windows.CreateFile(uPath, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
+	if err != nil {
+		// ERROR_PIPE_BUSY is an error that is issued somewhat sporadically but it's a safe
+		// indication that the pipe exists.
+		return err == windows.ERROR_PIPE_BUSY
+	}
+	defer windows.CloseHandle(h)
+	ft, err := windows.GetFileType(h)
+	return err == nil && ft|windows.FILE_TYPE_PIPE != 0
 }

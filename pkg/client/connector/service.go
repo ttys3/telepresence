@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -573,12 +572,12 @@ func run(c context.Context) error {
 		// Listen on unix domain socket
 		if client.SocketExists(client.ConnectorSocketName) {
 			return fmt.Errorf("socket %s exists so %s already started or terminated ungracefully",
-				client.SocketURL(client.ConnectorSocketName), processName)
+				client.ConnectorSocketName, processName)
 		}
 		defer func() {
 			_ = os.Remove(client.ConnectorSocketName)
 		}()
-		listener, err := net.Listen("unix", client.ConnectorSocketName)
+		listener, err := client.ListenSocket(c, client.ConnectorSocketName)
 		if err != nil {
 			return err
 		}

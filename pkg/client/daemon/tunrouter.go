@@ -97,8 +97,8 @@ type tunRouter struct {
 	mgrConfigured <-chan struct{}
 }
 
-func newTunRouter(managerConfigured <-chan struct{}) (*tunRouter, error) {
-	td, err := tun.OpenTun()
+func newTunRouter(ctx context.Context, managerConfigured <-chan struct{}) (*tunRouter, error) {
+	td, err := tun.OpenTun(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -111,11 +111,10 @@ func newTunRouter(managerConfigured <-chan struct{}) (*tunRouter, error) {
 	}, nil
 }
 
-func (t *tunRouter) configureDNS(_ context.Context, dnsIP net.IP, dnsPort uint16, dnsLocalAddr *net.UDPAddr) error {
+func (t *tunRouter) configureDNS(_ context.Context, dnsIP net.IP, dnsPort uint16, dnsLocalAddr *net.UDPAddr) {
 	t.dnsIP = dnsIP
 	t.dnsPort = dnsPort
 	t.dnsLocalAddr = dnsLocalAddr
-	return nil
 }
 
 func (t *tunRouter) setOutboundInfo(ctx context.Context, mi *daemon.OutboundInfo) (err error) {
@@ -154,16 +153,27 @@ func (t *tunRouter) setOutboundInfo(ctx context.Context, mi *daemon.OutboundInfo
 }
 
 func (t *tunRouter) stop(c context.Context) {
+	dlog.Debug(c, "stopping")
 	cc, cancel := context.WithTimeout(c, time.Second)
-	defer cancel()
 	go func() {
 		atomic.StoreInt32(&t.closing, 1)
+		dlog.Debug(c, "Closing all connection handlers")
 		t.handlers.CloseAll(cc)
+		dlog.Debug(c, "All connection handlers closed")
 		cancel()
 	}()
 	<-cc.Done()
-	atomic.StoreInt32(&t.closing, 2)
-	_ = t.dev.Close()
+	cc, cancel = context.WithTimeout(c, time.Second)
+	defer cancel()
+	go func() {
+		atomic.StoreInt32(&t.closing, 2)
+		dlog.Debug(c, "Closing TUN device")
+		_ = t.dev.Close()
+		dlog.Debug(c, "TUN device closed")
+		cancel()
+	}()
+	<-cc.Done()
+	dlog.Debug(c, "stopped")
 }
 
 var blockedUDPPorts = map[uint16]bool{
