@@ -80,6 +80,8 @@ type RotatingFile struct {
 
 	// birthTime is the time when the current file was first created
 	birthTime time.Time
+
+	errLog *os.File
 }
 
 // OpenRotatingFile opens a file with the given name after first having created the directory that it
@@ -117,7 +119,8 @@ func OpenRotatingFile(
 ) (*RotatingFile, error) {
 	logfileDir, logfileBase := filepath.Split(logfilePath)
 
-	if err := os.MkdirAll(logfileDir, 0755); err != nil {
+	var err error
+	if err = os.MkdirAll(logfileDir, 0755); err != nil {
 		return nil, err
 	}
 
@@ -132,14 +135,20 @@ func OpenRotatingFile(
 		maxFiles:   maxFiles,
 	}
 
+	eb := logfileBase[:len(logfileBase)-len(filepath.Ext(logfileBase))]
+	rf.errLog, err = os.Create(filepath.Join(logfileDir, eb+".err"))
+	if err != nil {
+		return nil, err
+	}
+
 	var info os.FileInfo
-	var err error
 	if info, err = os.Stat(logfilePath); err != nil {
 		if os.IsNotExist(err) {
 			if err = rf.openNew(nil); err == nil {
 				return rf, nil
 			}
 		}
+		fmt.Fprintf(rf.errLog, "openNew: %v", err)
 		return nil, err
 	}
 
@@ -148,6 +157,7 @@ func OpenRotatingFile(
 
 	// Open existing file for append
 	if rf.file, err = openForAppend(logfilePath, rf.fileMode); err != nil {
+		fmt.Fprintf(rf.errLog, "openForAppend: %v", err)
 		return nil, err
 	}
 	rf.afterOpen()
@@ -165,6 +175,7 @@ func (rf *RotatingFile) BirthTime() time.Time {
 
 // Close implements io.Closer
 func (rf *RotatingFile) Close() error {
+	rf.errLog.Close()
 	return rf.file.Close()
 }
 
@@ -192,11 +203,13 @@ func (rf *RotatingFile) Write(data []byte) (int, error) {
 
 	if rotateNow {
 		if err := rf.rotate(); err != nil {
+			fmt.Fprintf(rf.errLog, "rotate: %v", err)
 			return 0, err
 		}
 	}
 	l, err := rf.file.Write(data)
 	if err != nil {
+		fmt.Fprintf(rf.errLog, "write: %v", err)
 		return 0, err
 	}
 	rf.size += int64(l)

@@ -6,21 +6,19 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/datawire/dlib/derror"
-
 	"golang.org/x/sys/windows"
-
-	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
+	"github.com/datawire/dlib/derror"
+	"github.com/datawire/dlib/dexec"
 	"github.com/telepresenceio/telepresence/v2/pkg/tun/buffer"
 )
 
 type Device struct {
 	tun.Device
-	dev  *device.Device
 	name string
+	dns  net.IP
 }
 
 // OpenTun creates a new TUN device and ensures that it is up and running.
@@ -58,16 +56,27 @@ func (t *Device) RemoveSubnet(_ context.Context, subnet *net.IPNet) error {
 	return t.getLUID().DeleteIPAddress(*subnet)
 }
 
-func (t *Device) FlushDNSCache(_ context.Context) (err error) {
-	return nil
-}
-
-func (t *Device) SetDNS(_ context.Context, server net.IP, domains []string) (err error) {
-	luid := t.getLUID()
-	if ip4 := server.To4(); ip4 != nil {
-		return luid.SetDNS(windows.AF_INET, []net.IP{ip4}, domains)
+func (t *Device) SetDNS(ctx context.Context, server net.IP, domains []string) (err error) {
+	ipFamily := func(ip net.IP) winipcfg.AddressFamily {
+		f := winipcfg.AddressFamily(windows.AF_INET6)
+		if ip4 := ip.To4(); ip4 != nil {
+			f = windows.AF_INET
+		}
+		return f
 	}
-	return luid.SetDNS(windows.AF_INET6, []net.IP{server}, domains)
+	family := ipFamily(server)
+	luid := t.getLUID()
+	if t.dns != nil {
+		if oldFamily := ipFamily(t.dns); oldFamily != family {
+			_ = luid.FlushDNS(oldFamily)
+		}
+	}
+	if err = luid.SetDNS(family, []net.IP{server}, domains); err != nil {
+		return err
+	}
+	_ = dexec.CommandContext(ctx, "ipconfig", "/flushdns").Run()
+	t.dns = server
+	return nil
 }
 
 func (t *Device) SetMTU(mtu int) error {

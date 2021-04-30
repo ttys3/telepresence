@@ -48,7 +48,6 @@ func (o *outbound) dnsServerWorker(c context.Context) error {
 		v := dns.NewServer(c, []net.PacketConn{o.dnsListener}, nil, o.resolveInCluster)
 		return v.Run(c)
 	})
-	dns.Flush(c)
 	close(o.dnsConfigured)
 	return g.Wait()
 }

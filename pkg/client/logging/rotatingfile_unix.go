@@ -4,6 +4,8 @@ package logging
 
 import (
 	"os"
+
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 // createFile creates a new file or truncates an existing file.
@@ -15,3 +17,6 @@ func createFile(path string, perm os.FileMode) (*os.File, error) {
 func openForAppend(path string, perm os.FileMode) (*os.File, error) {
 	os.OpenFile(logfilePath, os.O_WRONLY|os.O_APPEND, perm)
 }
+
+// IsTerminal returns whether the given file descriptor is a terminal
+var IsTerminal = terminal.IsTerminal

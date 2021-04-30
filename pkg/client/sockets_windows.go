@@ -12,6 +12,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+// The Windows IPC between the CLI and the user and root daemons is based on named pipes rather than
+// unix sockets.
 const (
 	// ConnectorSocketName is the path used when communicating to the connector process
 	ConnectorSocketName = `\\.\pipe\telepresence-connector`
@@ -22,7 +24,7 @@ const (
 
 // DialSocket dials the given named pipet and returns the resulting connection
 func DialSocket(c context.Context, socketName string) (*grpc.ClientConn, error) {
-	return grpc.DialContext(c, socketName, grpc.WithInsecure(), grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
+	return grpc.DialContext(c, socketName, grpc.WithInsecure(), grpc.WithContextDialer(func(c context.Context, s string) (net.Conn, error) {
 		return winio.DialPipeContext(c, socketName)
 	}))
 }
