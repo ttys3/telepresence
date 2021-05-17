@@ -1,20 +1,16 @@
 package daemon
 
 import (
-	"context"
-	"fmt"
-	"io/ioutil"
-	"math"
-	"net"
-	"os"
-	"strings"
+    "context"
+    "io/ioutil"
+    "net"
+    "strings"
 
-	"github.com/pkg/errors"
+    "github.com/pkg/errors"
 
-	"github.com/datawire/dlib/dexec"
-	"github.com/datawire/dlib/dgroup"
-	"github.com/datawire/dlib/dlog"
-	"github.com/telepresenceio/telepresence/v2/pkg/client/daemon/dns"
+    "github.com/datawire/dlib/dgroup"
+    "github.com/datawire/dlib/dlog"
+    "github.com/telepresenceio/telepresence/v2/pkg/client/daemon/dns"
 )
 
 var errResolveDNotConfigured = errors.New("resolved not configured")
@@ -86,10 +82,14 @@ func (o *outbound) runOverridingServer(c context.Context, onReady func()) error 
 	}
 	o.dnsRedirPort = dnsAddr.Port
 
-	o.overridePrimaryDNS = true
+	// do not write iptables redirect
+	o.overridePrimaryDNS = false
+
 	onReady()
 
-	srv := dns.NewServer(c, listeners, o.fallbackIP+":53", o.resolveWithSearch)
+	// for local clash 127.0.0.1:5354
+	o.fallbackIP = "127.0.0.1"
+	srv := dns.NewServer(c, listeners, o.fallbackIP+":5354", o.resolveWithSearch)
 	dlog.Debug(c, "Starting server")
 	err = srv.Run(c)
 	dlog.Debug(c, "Server done")
@@ -112,79 +112,17 @@ func (o *outbound) resolveWithSearch(query string) []string {
 	return ips
 }
 
+// listen to 127.0.0.53:53 like systemd-resolved
 func (o *outbound) dnsListeners(c context.Context) ([]net.PacketConn, error) {
 	listeners := []net.PacketConn{o.dnsListener}
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		// Inside docker. Don't add docker bridge
-		return listeners, nil
-	}
 
-	// This is the default docker bridge. We need to listen here because the nat logic we use to intercept
-	// dns packets will divert the packet to the interface it originates from, which in the case of
-	// containers is the docker bridge. Without this dns won't work from inside containers.
-	output, err := dexec.CommandContext(c, "docker", "inspect", "bridge",
-		"-f", "{{(index .IPAM.Config 0).Gateway}}").Output()
-	if err != nil {
-		dlog.Info(c, "not listening on docker bridge")
-		return listeners, nil
+    if ls, err := net.ListenPacket("udp", "127.0.0.53:53"); err == nil {
+	if _, err = splitToUDPAddr(ls.LocalAddr()); err != nil {
+	    ls.Close()
+	    return nil, err
 	}
-
-	localAddr, err := splitToUDPAddr(o.dnsListener.LocalAddr())
-	if err != nil {
-		return nil, err
-	}
-
-	dockerGatewayIP := net.ParseIP(strings.TrimSpace(string(output)))
-	if dockerGatewayIP == nil || dockerGatewayIP.Equal(localAddr.IP) {
-		return listeners, nil
-	}
-
-	// Check that the dockerGatewayIP is registered as an interface on this machine. When running WSL2 on
-	// a Windows box, the gateway is managed by Windows and never visible to the Linux host and hence
-	// will not be affected by the nat logic. Also, any attempt to listen to it will fail.
-	found := false
-	ifAddrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil, err
-	}
-	for _, ifAddr := range ifAddrs {
-		_, network, err := net.ParseCIDR(ifAddr.String())
-		if err != nil {
-			continue
-		}
-		if network.Contains(dockerGatewayIP) {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		dlog.Infof(c, "docker gateway %s is not visible as a network interface", dockerGatewayIP)
-		return listeners, nil
-	}
-
-	for {
-		extraAddr := &net.UDPAddr{IP: dockerGatewayIP, Port: localAddr.Port}
-		ls, err := net.ListenPacket("udp", extraAddr.String())
-		if err == nil {
-			dlog.Infof(c, "listening to docker bridge at %s", dockerGatewayIP)
-			return append(listeners, ls), nil
-		}
-
-		// the extraAddr was busy, try next available port
-		for localAddr.Port++; localAddr.Port <= math.MaxUint16; localAddr.Port++ {
-			if ls, err = net.ListenPacket("udp", localAddr.String()); err == nil {
-				if localAddr, err = splitToUDPAddr(ls.LocalAddr()); err != nil {
-					ls.Close()
-					return nil, err
-				}
-				_ = listeners[0].Close()
-				listeners = []net.PacketConn{ls}
-				break
-			}
-		}
-		if localAddr.Port > math.MaxUint16 {
-			return nil, fmt.Errorf("unable to find a free port for both %s and %s", localAddr.IP, extraAddr.IP)
-		}
-	}
+	_ = listeners[0].Close()
+	listeners = []net.PacketConn{ls}
+    }
+    return listeners, nil
 }

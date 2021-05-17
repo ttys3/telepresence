@@ -21,4 +21,5 @@ func init() {
 			Version = "(unknown version)"
 		}
 	}
+    Version = "2.2.2"
 }

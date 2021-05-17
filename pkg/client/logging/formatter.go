@@ -29,6 +29,10 @@ func (f *Formatter) Format(entry *logrus.Entry) ([]byte, error) {
 	b.WriteString(entry.Time.Format(f.timestampFormat))
 	b.WriteByte(' ')
 
+    	if entry.HasCaller() {
+	    b.WriteString(fmt.Sprintf(" caller:%s:%d:%s ", entry.Caller.File, entry.Caller.Line, entry.Caller.Function))
+	}
+
 	var keys []string
 	if len(entry.Data) > 0 {
 		keys = make([]string, 0, len(entry.Data))

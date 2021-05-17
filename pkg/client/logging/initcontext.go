@@ -19,6 +19,7 @@ var IsTerminal = terminal.IsTerminal
 func InitContext(ctx context.Context, name string) (context.Context, error) {
 	logger := logrus.StandardLogger()
 	logger.SetLevel(logrus.DebugLevel)
+	logger.SetReportCaller(true)
 
 	if IsTerminal(int(os.Stdout.Fd())) {
 		logger.Formatter = NewFormatter("15:04:05")
