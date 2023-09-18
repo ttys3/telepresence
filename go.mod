@@ -32,10 +32,10 @@ require (
 	google.golang.org/protobuf v1.25.0
 	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
 	gotest.tools v2.2.0+incompatible
-	k8s.io/api v0.18.8
+	k8s.io/api v0.18.14
 	k8s.io/apiextensions-apiserver v0.18.8 // indirect
-	k8s.io/apimachinery v0.18.8
-	k8s.io/client-go v0.18.8
+	k8s.io/apimachinery v0.18.14
+	k8s.io/client-go v0.18.14
 	k8s.io/kubectl v0.18.8 // indirect
 	sigs.k8s.io/yaml v1.2.0
 )
